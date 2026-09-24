@@ -9,7 +9,7 @@ python3 - "$build" <<'PY'
 from pathlib import Path
 import sys,re
 s=Path('components/ts_webui/src/ts_webui_ws.c').read_text()
-names=['ts_webui_log_stream_enable','has_log_clients','update_log_stream_state','set_client_role','ssh_terminal_done','ssh_generation_valid','ssh_status_valid','ssh_request_error','ssh_send_status','ssh_send_output','ssh_poll_task','ssh_cleanup','handle_ssh_connect','start_terminal_session','ts_webui_ws_stop','ssh_exec_terminal_publish','ws_handler']
+names=['ts_webui_log_stream_enable','has_log_clients','update_log_stream_state','set_client_role','ssh_terminal_done','ssh_generation_valid','ssh_status_valid','ssh_request_error','ssh_send_status','ssh_output_done','ssh_terminal_flush','ssh_send_output','ssh_poll_task','ssh_cleanup','handle_ssh_connect','start_terminal_session','ts_webui_ws_stop','ssh_exec_output_done','ssh_exec_stream_publish','ssh_exec_terminal_flush','ssh_exec_terminal_publish','ws_handler']
 parts=[]
 for name in names:
  m=re.search(r'^(?:static )?(?:esp_err_t|bool|void) '+name+r'\([^;]*?\)\n\{',s,re.M);assert m,name

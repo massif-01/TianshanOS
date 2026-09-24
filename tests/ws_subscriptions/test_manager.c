@@ -35,6 +35,7 @@ static void(*delay_hook)(void);
 static void(*api_hook)(void);
 static bool queue_fail, immediate, send_fail, task_fail, api_business_error;
 static unsigned shutdowns;
+static int sent_fd,send_fail_fd=-1;
 int test_shutdown(int fd,int how){(void)how;assert(fd>0);shutdowns++;return 0;}
 static void(*wait_hook)(void);
 static const char *barrier_name;
@@ -51,7 +52,7 @@ unsigned ulTaskNotifyTake(int clear,TickType_t ticks) {(void)clear;(void)ticks;a
 void vTaskDelete(TaskHandle_t t) {(void)t;}
 void vTaskDelay(TickType_t t) {test_now+=(int64_t)t*1000;if(delay_hook)delay_hook();}
 int httpd_ws_get_fd_info(httpd_handle_t h,int fd) {(void)h;(void)fd;return HTTPD_WS_CLIENT_WEBSOCKET;}
-int httpd_ws_send_frame_async(httpd_handle_t h,int fd,httpd_ws_frame_t*f) {(void)h;assert(fd>=0&&fd<32);frames[fd]++;if(sent_hook && !send_fail)sent_hook(f);memcpy(payloads[fd],f->payload,f->len);payloads[fd][f->len]=0;return send_fail?ESP_FAIL:0;}
+int httpd_ws_send_frame_async(httpd_handle_t h,int fd,httpd_ws_frame_t*f) {(void)h;assert(fd>=0&&fd<32);frames[fd]++;sent_fd=fd;if(sent_hook && !send_fail && send_fail_fd!=fd)sent_hook(f);memcpy(payloads[fd],f->payload,f->len);payloads[fd][f->len]=0;return send_fail || send_fail_fd==fd?ESP_FAIL:0;}
 int httpd_queue_work(httpd_handle_t h,void(*fn)(void*),void*a) {(void)h;if(queue_fail)return ESP_FAIL;if(immediate) {TaskHandle_t saved=current;current=(void*)3;fn(a);current=saved;}else{assert(queued<64);queue[queued++]=(typeof(queue[0])){fn,a};}return 0;}
 int ts_api_call(const char*method,const cJSON*p,ts_api_result_t*r) {(void)p;for(int i=0;i<7;i++)if(!strcmp(metrics[i],method))reads[i]++;if(api_hook)api_hook();r->data=cJSON_CreateObject();r->message=malloc(8);r->code=api_business_error?1:0;return 0;}
 static void pump(void) {
@@ -160,7 +161,9 @@ int main(void) {
  char *big=malloc(TS_WS_LEGACY_BYTES);memset(big,'x',TS_WS_LEGACY_BYTES);
  ts_ws_message_t *large=ts_ws_message_text(big,TS_WS_LEGACY_BYTES-1);assert(large);assert(!ts_ws_message_text(big,TS_WS_LEGACY_BYTES));ts_ws_message_release(large);free(big);
  ts_ws_message_t *one=ts_ws_message_text("{}",2);assert(one);
- for(int i=0;i<TS_WS_TOPIC_TX_SLOTS;i++)assert(ts_ws_transport_submit(a,one,0,0,NULL,capacity_done)==0);
+ j=cJSON_CreateObject();ts_ws_message_t *topic_message=ts_ws_message_json("capacity",j,0);cJSON_Delete(j);assert(topic_message);
+ for(int i=0;i<TS_WS_TOPIC_TX_SLOTS;i++)assert(ts_ws_transport_submit(a,topic_message,0,0,NULL,capacity_done)==0);
+ ts_ws_message_release(topic_message);
  for(int i=0;i<TS_WS_CONNECTIONS;i++)assert(ts_ws_transport_submit(a,one,0,0,NULL,NULL)==0);
  assert(ts_ws_transport_submit(a,one,0,0,NULL,NULL)==ESP_ERR_NO_MEM);
  ts_ws_message_release(one);pump();

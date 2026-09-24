@@ -18,6 +18,7 @@ typedef enum {WS_CLIENT_TYPE_EVENT,WS_CLIENT_TYPE_TERMINAL,WS_CLIENT_TYPE_SSH_SH
 static struct {bool active;int fd;httpd_handle_t hd;ws_client_type_t type;int log_min_level;}s_clients[MAX_WS_CLIENTS];
 static httpd_handle_t s_server=(void*)11;
 static bool s_ws_stopping,s_exec_running;
+static atomic_bool s_exec_terminal_claimed;
 static atomic_uint s_exec_creators;
 static ts_event_handler_handle_t s_power_event_handle;
 static ts_ws_peer_t s_ssh_peer;
@@ -27,6 +28,14 @@ static atomic_bool s_ssh_running,s_ssh_poll_alive;
 enum {SSH_IDLE,SSH_STARTING,SSH_READY,SSH_TERMINAL};
 static atomic_uint s_ssh_state,s_ssh_generation,s_ssh_result_pending;
 static ts_ws_reservation_t s_ssh_terminal,s_exec_terminal;
+static atomic_uint s_ssh_output_pending,s_exec_output_pending;
+static atomic_bool s_ssh_output_failed,s_exec_output_failed,s_ssh_terminal_ready,s_exec_terminal_ready,s_exec_result_active;
+static unsigned s_exec_session_id;
+static ts_ws_peer_t s_exec_result_peers[TS_WS_CONNECTIONS];
+static unsigned s_exec_result_count;
+static void ssh_terminal_flush(void);
+static void ssh_exec_terminal_flush(void);
+static void ssh_exec_terminal_publish(const char*,uint32_t);
 static bool shell_active,create_fails,close_on_create;
 static void update_log_stream_state(void);
 static bool has_log_clients(void);
@@ -115,9 +124,11 @@ static void observe_topic(httpd_ws_frame_t*f){
   if(strstr((const char*)f->payload,match))observed_topics[i]++;
  }
 }
+
+#ifndef WS_REVIEWER_NO_MAIN
 int main(void){
  cJSON_Hooks hooks={tracked_malloc,tracked_free};cJSON_InitHooks(&hooks);
- start();open_peer(1);open_peer(2);assert(ts_ws_result_reserve(4096,&s_exec_terminal)==0);s_exec_running=true;delay_hook=progress;
+ start();open_peer(1);open_peer(2);s_exec_terminal_claimed=false;assert(ts_ws_result_reserve(4096,&s_exec_terminal)==0);s_exec_running=true;delay_hook=progress;
  assert(ts_webui_ws_stop((void*)11)==ESP_ERR_INVALID_STATE);delay_hook=NULL;
  assert(s_worker && s_state==DRAINING);
  reqs[1].method=1;incoming="{\"type\":\"ping\"}";current=(void*)3;
@@ -182,11 +193,11 @@ int main(void){
  ts_ws_message_t *full1=ts_ws_message_text("full1",5),*full2=ts_ws_message_text("full2",5);assert(full1&&full2);
  ssh_send_output("payload",7);assert(s_ssh_state==SSH_TERMINAL && !s_ssh_running);
  poll_exit();current=(void*)1;ts_ws_message_release(full1);ts_ws_message_release(full2);pump();
- assert(strstr(payloads[1],"SSH output delivery failed") && !s_ssh_session && !s_ssh_poll_alive);
+ assert(strstr(payloads[1],"SSH output delivery incomplete") && !s_ssh_session && !s_ssh_poll_alive);
  finish();
  puts("PASS R2: task-create failure/early close never end as connected; reserved failure survives normal pool saturation and SDK queue rejection; late READY invalid");
 
- start();open_peer(1);assert(ts_ws_result_reserve(TS_WS_LEGACY_BYTES,&s_exec_terminal)==0);
+ start();open_peer(1);s_exec_terminal_claimed=false;assert(ts_ws_result_reserve(TS_WS_LEGACY_BYTES,&s_exec_terminal)==0);
  m1=ts_ws_message_text("one",3);m2=ts_ws_message_text("two",3);assert(m1&&m2);
  open_peer(2);a=frames[1];b=frames[2];
  ssh_exec_terminal_publish("{\"type\":\"ssh_exec_done\",\"session_id\":7}",7);
@@ -212,8 +223,10 @@ int main(void){
  test_now+=10000000;before=total_reads();run_batch();assert(total_reads()==before);
  ts_ws_reservation_release(&reserved);run_batch();pump();assert(total_reads()>before);
  char*large=malloc(TS_WS_LEGACY_BYTES);memset(large,'x',TS_WS_LEGACY_BYTES);
- m1=ts_ws_message_text(large,TS_WS_LEGACY_BYTES-1);m2=ts_ws_message_text(large,TS_WS_LEGACY_BYTES-1);assert(m1&&m2);free(large);
+ m1=ts_ws_message_text(large,TS_WS_LEGACY_BYTES-1);m2=ts_ws_message_text(large,TS_WS_LEGACY_BYTES-TS_WS_POWER_BUDGET-1);assert(m1&&m2);free(large);
  test_now+=10000000;before=total_reads();run_batch();assert(total_reads()==before);
  ts_ws_message_release(m1);ts_ws_message_release(m2);run_batch();pump();assert(total_reads()>before);finish();
  puts("PASS R5: all eight topics progress under six-slot pressure; no API collection without message/descriptor/byte capacity");
 }
+
+#endif

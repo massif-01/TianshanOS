@@ -28,6 +28,7 @@
 #include <ctype.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <math.h>
 
 #define TAG "webui_ws"
 
@@ -84,6 +85,17 @@ enum { SSH_IDLE, SSH_STARTING, SSH_READY, SSH_TERMINAL };
 static atomic_uint s_ssh_state, s_ssh_generation, s_ssh_result_pending;
 static ts_ws_reservation_t s_ssh_terminal;
 static ts_ws_reservation_t s_exec_terminal;
+/* One producer per stream. Pending includes each accepted destination, including
+ * publication callbacks that can run before submit returns. Terminal buffers
+ * are not published/released until all earlier output has settled. */
+static atomic_uint s_ssh_output_pending, s_exec_output_pending;
+static atomic_bool s_ssh_output_failed, s_exec_output_failed;
+static atomic_bool s_ssh_terminal_ready, s_exec_terminal_ready, s_exec_result_active, s_exec_terminal_claimed;
+static ts_ws_peer_t s_exec_result_peers[TS_WS_CONNECTIONS];
+static unsigned s_exec_result_count;
+static void ssh_terminal_flush(void);
+static void ssh_exec_terminal_flush(void);
+static void ssh_exec_terminal_publish(const char *json,uint32_t session_id);
 
 /* SSH Exec 流式执行状态 */
 static ts_ssh_session_t s_exec_session = NULL;
@@ -146,36 +158,36 @@ static void power_policy_event_handler(const ts_event_t *event, void *user_data)
     
     ts_power_policy_status_t *status = (ts_power_policy_status_t *)event->data;
     
-    // 构造事件消息
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "type", "power_event");
-    cJSON_AddStringToObject(msg, "state", power_state_to_string(status->state));
-    cJSON_AddNumberToObject(msg, "voltage", status->current_voltage);
-    cJSON_AddNumberToObject(msg, "countdown", status->countdown_remaining_sec);
-    cJSON_AddNumberToObject(msg, "protection_count", status->protection_count);
-    
-    // 根据事件 ID 添加具体事件类型（使用 ts_power_policy_event_t 枚举值）
-    const char *event_name = "unknown";
-    switch (event->id) {
-        case TS_POWER_POLICY_EVENT_STATE_CHANGED:    event_name = "state_changed"; break;
-        case TS_POWER_POLICY_EVENT_LOW_VOLTAGE:      event_name = "low_voltage"; break;
-        case TS_POWER_POLICY_EVENT_COUNTDOWN_TICK:   event_name = "countdown_tick"; break;
-        case TS_POWER_POLICY_EVENT_SHUTDOWN_START:   event_name = "shutdown_start"; break;
-        case TS_POWER_POLICY_EVENT_PROTECTED:        event_name = "protected"; break;
-        case TS_POWER_POLICY_EVENT_RECOVERY_START:   event_name = "recovery_start"; break;
-        case TS_POWER_POLICY_EVENT_RECOVERY_COMPLETE: event_name = "recovery_complete"; break;
-        case TS_POWER_POLICY_EVENT_DEBUG_TICK:       event_name = "debug_tick"; break;
+    bool tick=event->id==TS_POWER_POLICY_EVENT_COUNTDOWN_TICK || event->id==TS_POWER_POLICY_EVENT_DEBUG_TICK;
+    ts_ws_reservation_t reservation;
+    esp_err_t ret=ts_ws_power_reserve(tick,&reservation);
+    if(ret!=ESP_OK) {
+        TS_LOGW(TAG,"Power notification admission failed: event=%ld result=%d",(long)event->id,ret);
+        return; /* bounded overload; never wait on protection's event callback */
     }
-    cJSON_AddStringToObject(msg, "event", event_name);
-    
-    char *json = cJSON_PrintUnformatted(msg);
-    cJSON_Delete(msg);
-    
-    if (json) {
-        // 广播给所有连接的客户端
-        ts_webui_broadcast(json);
-        free(json);
+    if(!reservation.message)return;
+    const char *event_name="unknown";
+    switch(event->id) {
+        case TS_POWER_POLICY_EVENT_STATE_CHANGED:event_name="state_changed";break;
+        case TS_POWER_POLICY_EVENT_LOW_VOLTAGE:event_name="low_voltage";break;
+        case TS_POWER_POLICY_EVENT_COUNTDOWN_TICK:event_name="countdown_tick";break;
+        case TS_POWER_POLICY_EVENT_SHUTDOWN_START:event_name="shutdown_start";break;
+        case TS_POWER_POLICY_EVENT_PROTECTED:event_name="protected";break;
+        case TS_POWER_POLICY_EVENT_RECOVERY_START:event_name="recovery_start";break;
+        case TS_POWER_POLICY_EVENT_RECOVERY_COMPLETE:event_name="recovery_complete";break;
+        case TS_POWER_POLICY_EVENT_DEBUG_TICK:event_name="debug_tick";break;
     }
+    /* Fixed schema, numeric values and constant strings; no heap JSON needed.
+     * Preserve cJSON's non-finite-number encoding as null. */
+    char voltage[32],json[512];
+    if(isfinite(status->current_voltage))snprintf(voltage,sizeof(voltage),"%.17g",(double)status->current_voltage);
+    else strcpy(voltage,"null");
+    int n=snprintf(json,sizeof(json),"{\"type\":\"power_event\",\"state\":\"%s\",\"voltage\":%s,\"countdown\":%lu,\"protection_count\":%lu,\"event\":\"%s\"}",
+        power_state_to_string(status->state),voltage,(unsigned long)status->countdown_remaining_sec,(unsigned long)status->protection_count,event_name);
+    ret=n<0 || n>=(int)sizeof(json)?ESP_ERR_INVALID_SIZE:ts_ws_power_publish(&reservation,json);
+    ts_ws_reservation_release(&reservation);
+    if(ret!=ESP_OK)TS_LOGW(TAG,"Power notification submission failed: event=%ld result=%d",(long)event->id,ret);
+
 }
 
 /*===========================================================================*/
@@ -212,10 +224,34 @@ static void ssh_request_error(httpd_req_t *req, const char *message)
     free(json);
 }
 
+static void ssh_output_done(uint64_t generation,uint64_t delivery,esp_err_t result)
+{
+    (void)delivery; /* transport already validates full peer identity */
+    if(generation!=s_ssh_generation)return;
+    if(result!=ESP_OK){s_ssh_output_failed=true;s_ssh_running=false;}
+    atomic_fetch_sub(&s_ssh_output_pending,1);
+    if(result!=ESP_OK)ssh_send_status("error","SSH output delivery incomplete; remote command result is not confirmed");
+    ssh_terminal_flush();
+}
+static void ssh_terminal_flush(void)
+{
+    if(s_ssh_output_pending)return;
+    bool ready=true;
+    if(!atomic_compare_exchange_strong(&s_ssh_terminal_ready,&ready,false))return;
+    unsigned generation=s_ssh_generation;
+    if(s_ssh_output_failed)ts_ws_reserved_text(&s_ssh_terminal,
+        "{\"type\":\"ssh_status\",\"status\":\"error\",\"message\":\"SSH output delivery incomplete; remote command result is not confirmed\"}");
+    ts_ws_reservation_t terminal=s_ssh_terminal;
+    s_ssh_terminal=(ts_ws_reservation_t){0};
+    esp_err_t ret=ts_ws_reserved_submit(&terminal,0,generation,SSH_TERMINAL,ssh_status_valid,ssh_terminal_done);
+    if(ret!=ESP_OK)ssh_terminal_done(generation,SSH_TERMINAL,ret);
+    ts_ws_reservation_release(&terminal);
+}
+
 /* 发送 SSH 输出到 WebSocket 客户端 */
 static void ssh_send_output(const char *data, size_t len)
 {
-    if(s_ssh_client_fd<0 || !s_server || !data || !len)return;
+    if(s_ssh_client_fd<0 || !s_server || !data || !len || s_ssh_state!=SSH_READY)return;
     esp_err_t ret=ESP_ERR_NO_MEM;
     char *buf=heap_caps_malloc(len+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!buf)buf=malloc(len+1);
@@ -230,11 +266,17 @@ static void ssh_send_output(const char *data, size_t len)
     free(buf);cJSON_Delete(msg);
     if(json) {
         ts_ws_message_t *m=ts_ws_message_text(json,strlen(json));
-        if(m)ret=ts_ws_transport_submit(s_ssh_peer,m,s_ssh_generation,0,ssh_generation_valid,NULL);
+        if(m) {
+            atomic_fetch_add(&s_ssh_output_pending,1);
+            ret=ts_ws_transport_submit(s_ssh_peer,m,s_ssh_generation,s_ssh_peer.connection,ssh_generation_valid,ssh_output_done);
+            /* Rejection was never accepted and has no completion callback. */
+            if(ret!=ESP_OK)ssh_output_done(s_ssh_generation,s_ssh_peer.connection,ret);
+        }
         ts_ws_message_release(m);
     }
     free(json);
     if(ret!=ESP_OK) {
+        s_ssh_output_failed=true;
         TS_LOGW(TAG,"SSH output rejected: %s",esp_err_to_name(ret));
         ssh_send_status("error","SSH output delivery failed");
         s_ssh_running=false;
@@ -265,12 +307,9 @@ static esp_err_t ssh_send_status(const char *status, const char *message)
             TS_LOGW(TAG,"SSH terminal encoding failed: %s",esp_err_to_name(ret));
             ret=ts_ws_reserved_text(&s_ssh_terminal,fallback);
         }
-        if(ret==ESP_OK) {
-            s_ssh_result_pending=generation;
-            ret=ts_ws_reserved_submit(&s_ssh_terminal,0,generation,state,ssh_status_valid,ssh_terminal_done);
-            if(ret!=ESP_OK)ssh_terminal_done(generation,state,ret);
-        }
-        ts_ws_reservation_release(&s_ssh_terminal);
+        s_ssh_result_pending=generation;
+        if(ret==ESP_OK){s_ssh_terminal_ready=true;ssh_terminal_flush();}
+        else {ssh_terminal_done(generation,state,ret);ts_ws_reservation_release(&s_ssh_terminal);}
     } else if(json && ssh_status_valid(generation,state)) {
         httpd_ws_frame_t frame={.type=HTTPD_WS_TYPE_TEXT,.payload=(uint8_t*)json,.len=strlen(json)};
         if(ts_ws_transport_in_context()) ret=ts_ws_transport_send(s_ssh_peer.server,s_ssh_peer.fd,&frame);
@@ -376,7 +415,7 @@ static void ssh_cleanup(void)
     }
     if(s_ssh_state==SSH_READY) ssh_send_status("closed","SSH session closed");
     s_ssh_client_fd = -1;
-    ts_ws_reservation_release(&s_ssh_terminal);
+    if(!s_ssh_result_pending && !s_ssh_output_pending)ts_ws_reservation_release(&s_ssh_terminal);
     
     TS_LOGD(TAG, "SSH session cleaned up");
 }
@@ -384,7 +423,7 @@ static void ssh_cleanup(void)
 /* 处理 SSH Shell 连接请求 */
 static void handle_ssh_connect(httpd_req_t *req, cJSON *params)
 {
-    if (s_ssh_result_pending) {
+    if (s_ssh_result_pending || s_ssh_output_pending) {
         ssh_request_error(req,"Previous SSH result is still pending");
         return;
     }
@@ -422,6 +461,8 @@ static void handle_ssh_connect(httpd_req_t *req, cJSON *params)
         ssh_request_error(req,"SSH result delivery capacity unavailable");
         return;
     }
+    s_ssh_output_failed=false;
+    s_ssh_terminal_ready=false;
     s_ssh_generation++;
     s_ssh_state=SSH_STARTING;
     // 设置 SSH 客户端 fd
@@ -1255,6 +1296,7 @@ esp_err_t ts_webui_ws_stop(httpd_handle_t server)
     if (ret != ESP_OK) return ret;
     ret = ts_ws_subscriptions_drain();
     if (ret != ESP_OK) return ret;
+    if(s_exec_result_active || s_ssh_result_pending || s_ssh_output_pending)return ESP_ERR_INVALID_STATE;
     ret = ts_ws_transport_stop(server, 6000);
     if (ret != ESP_OK) return ret;
     return ts_ws_subscriptions_deinit();
@@ -1513,6 +1555,31 @@ static bool simple_pattern_match(const char *text, const char *pattern, char **e
     }
 }
 
+static void ssh_exec_output_done(uint64_t session,uint64_t connection,esp_err_t result)
+{
+    (void)connection;
+    if(session!=s_exec_session_id)return;
+    if(result!=ESP_OK)s_exec_output_failed=true;
+    atomic_fetch_sub(&s_exec_output_pending,1);
+    if(result!=ESP_OK)ssh_exec_terminal_publish(NULL,(uint32_t)session);
+    ssh_exec_terminal_flush();
+}
+static void ssh_exec_stream_publish(const char *json,uint32_t session)
+{
+    if(session!=s_exec_session_id || s_exec_output_failed)return;
+    ts_ws_peer_t peers[TS_WS_CONNECTIONS];
+    unsigned n=ts_ws_peer_snapshot(peers,TS_WS_CONNECTIONS);
+    if(!n)return;
+    ts_ws_message_t *m=json?ts_ws_message_text(json,strlen(json)):NULL;
+    if(!m){s_exec_output_failed=true;ssh_exec_terminal_publish(NULL,session);return;}
+    atomic_fetch_add(&s_exec_output_pending,n); /* register the whole fanout before any early callback */
+    for(unsigned i=0;i<n;i++) {
+        esp_err_t ret=ts_ws_transport_submit(peers[i],m,session,peers[i].connection,NULL,ssh_exec_output_done);
+        if(ret!=ESP_OK)ssh_exec_output_done(session,peers[i].connection,ret);
+    }
+    ts_ws_message_release(m);
+}
+
 /* SSH Exec 输出回调 - 广播到所有 WebSocket 客户端并收集输出 */
 static void ssh_exec_output_callback(const char *data, size_t len, bool is_stderr, void *user_data)
 {
@@ -1531,30 +1598,18 @@ static void ssh_exec_output_callback(const char *data, size_t len, bool is_stder
         }
     }
     
-    /* 构造消息 */
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "type", "ssh_exec_output");
-    cJSON_AddNumberToObject(msg, "session_id", session_id);
-    cJSON_AddBoolToObject(msg, "is_stderr", is_stderr);
-    
-    /* 复制数据并确保 null 结尾 */
-    char *buf = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) buf = malloc(len + 1);
-    if (buf) {
-        memcpy(buf, data, len);
-        buf[len] = '\0';
-        cJSON_AddStringToObject(msg, "data", buf);
-        free(buf);
-    }
-    
-    char *json = cJSON_PrintUnformatted(msg);
-    cJSON_Delete(msg);
-    
-    if (json) {
-        ts_webui_broadcast(json);
-        free(json);
-    }
-    
+    cJSON *msg=cJSON_CreateObject();
+    char *buf=heap_caps_malloc(len+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(!buf)buf=malloc(len+1);
+    if(buf){memcpy(buf,data,len);buf[len]=0;}
+    bool encoded=buf && msg && cJSON_AddStringToObject(msg,"type","ssh_exec_output") &&
+        cJSON_AddNumberToObject(msg,"session_id",session_id) && cJSON_AddBoolToObject(msg,"is_stderr",is_stderr) &&
+        cJSON_AddStringToObject(msg,"data",buf);
+    char *json=encoded?cJSON_PrintUnformatted(msg):NULL;
+    free(buf);cJSON_Delete(msg);
+    ssh_exec_stream_publish(json,session_id);
+    free(json);
+
     /* 实时模式匹配 */
     if (s_exec_params && s_exec_params->output_buffer) {
         const char *output = s_exec_params->output_buffer;
@@ -1641,10 +1696,8 @@ static void ssh_exec_output_callback(const char *data, size_t len, bool is_stder
             
             char *match_json = cJSON_PrintUnformatted(match_msg);
             cJSON_Delete(match_msg);
-            if (match_json) {
-                ts_webui_broadcast(match_json);
-                free(match_json);
-            }
+            ssh_exec_stream_publish(match_json,session_id);
+            free(match_json);
             
             /* ========== 根据命令类型决定变量更新时机 ========== */
             /* 
@@ -1734,14 +1787,34 @@ static void ssh_exec_timeout_callback(TimerHandle_t xTimer)
 
 /* Every accepted streamed command owns one result reservation. Ordinary output
  * cannot consume it. Oversize/encoding failure is reported, never as success. */
-static void ssh_exec_terminal_publish(const char *json,uint32_t session_id)
+static void ssh_exec_terminal_flush(void)
 {
-    char fallback[192];
-    snprintf(fallback,sizeof(fallback),"{\"type\":\"ssh_exec_error\",\"session_id\":%lu,\"error\":\"SSH result delivery failed; result is unknown\"}",(unsigned long)session_id);
-    esp_err_t ret=ts_ws_result_broadcast(&s_exec_terminal,json?json:fallback);
-    if(ret==ESP_ERR_INVALID_SIZE)ret=ts_ws_result_broadcast(&s_exec_terminal,fallback);
+    if(s_exec_output_pending)return;
+    bool ready=true;
+    if(!atomic_compare_exchange_strong(&s_exec_terminal_ready,&ready,false))return;
+    if(s_exec_output_failed) {
+        char fallback[224];
+        snprintf(fallback,sizeof(fallback),"{\"type\":\"ssh_exec_error\",\"session_id\":%lu,\"error\":\"SSH output delivery incomplete; remote command result is not confirmed\"}",(unsigned long)s_exec_session_id);
+        ts_ws_reserved_text(&s_exec_terminal,fallback);
+    }
+    /* Completion owns the original recipient snapshot; never retarget on retry. */
+    esp_err_t ret=ts_ws_result_publish(&s_exec_terminal,s_exec_result_peers,s_exec_result_count);
     if(ret!=ESP_OK)TS_LOGW(TAG,"SSH terminal result rejected: %s",esp_err_to_name(ret));
     ts_ws_reservation_release(&s_exec_terminal);
+    s_exec_result_active=false;
+}
+static void ssh_exec_terminal_publish(const char *json,uint32_t session_id)
+{
+    bool claimed=false;
+    if(!atomic_compare_exchange_strong(&s_exec_terminal_claimed,&claimed,true))return;
+    char fallback[192];
+    snprintf(fallback,sizeof(fallback),"{\"type\":\"ssh_exec_error\",\"session_id\":%lu,\"error\":\"SSH result delivery failed; result is unknown\"}",(unsigned long)session_id);
+    esp_err_t ret=ts_ws_reserved_text(&s_exec_terminal,json?json:fallback);
+    if(ret!=ESP_OK)ret=ts_ws_reserved_text(&s_exec_terminal,fallback);
+    if(ret!=ESP_OK){TS_LOGW(TAG,"SSH terminal encoding failed: %s",esp_err_to_name(ret));ts_ws_reservation_release(&s_exec_terminal);s_exec_result_active=false;return;}
+    s_exec_result_count=ts_ws_peer_snapshot(s_exec_result_peers,TS_WS_CONNECTIONS);
+    s_exec_terminal_ready=true;
+    ssh_exec_terminal_flush();
 }
 
 /* SSH Exec 任务 */
@@ -1830,7 +1903,7 @@ static void ssh_exec_task(void *arg)
         }
         char *json = cJSON_PrintUnformatted(msg);
         cJSON_Delete(msg);
-        if (json) { ts_webui_broadcast(json); free(json); }
+        ssh_exec_stream_publish(json,session_id); free(json);
     }
     
     /* 判断是否需要启动超时定时器 */
@@ -2218,11 +2291,12 @@ esp_err_t ts_webui_ssh_exec_start(const char *host, uint16_t port,
 {
     unsigned creators = atomic_fetch_add(&s_exec_creators, 1);
     esp_err_t ret=ESP_ERR_INVALID_STATE;
-    if(!creators && !s_ws_stopping && !s_exec_running) {
+    if(!creators && !s_ws_stopping && !s_exec_running && !s_exec_result_active) {
         ret=ts_ws_result_reserve(TS_WS_LEGACY_BYTES,&s_exec_terminal);
+        if(ret==ESP_OK){s_exec_result_active=true;s_exec_output_failed=false;s_exec_terminal_ready=false;s_exec_terminal_claimed=false;}
         if(ret==ESP_OK) {
             ret=ts_webui_ssh_exec_start_impl(host, port, user, keyid, password, command, session_id);
-            if(ret!=ESP_OK)ts_ws_reservation_release(&s_exec_terminal);
+            if(ret!=ESP_OK){ts_ws_reservation_release(&s_exec_terminal);s_exec_result_active=false;}
         }
     }
     atomic_fetch_sub(&s_exec_creators, 1);
@@ -2441,11 +2515,12 @@ esp_err_t ts_webui_ssh_exec_start_ex(const char *host, uint16_t port,
 {
     unsigned creators = atomic_fetch_add(&s_exec_creators, 1);
     esp_err_t ret=ESP_ERR_INVALID_STATE;
-    if(!creators && !s_ws_stopping && !s_exec_running) {
+    if(!creators && !s_ws_stopping && !s_exec_running && !s_exec_result_active) {
         ret=ts_ws_result_reserve(TS_WS_LEGACY_BYTES,&s_exec_terminal);
+        if(ret==ESP_OK){s_exec_result_active=true;s_exec_output_failed=false;s_exec_terminal_ready=false;s_exec_terminal_claimed=false;}
         if(ret==ESP_OK) {
             ret=ts_webui_ssh_exec_start_ex_impl(host, port, user, keyid, password, command, options, session_id);
-            if(ret!=ESP_OK)ts_ws_reservation_release(&s_exec_terminal);
+            if(ret!=ESP_OK){ts_ws_reservation_release(&s_exec_terminal);s_exec_result_active=false;}
         }
     }
     atomic_fetch_sub(&s_exec_creators, 1);

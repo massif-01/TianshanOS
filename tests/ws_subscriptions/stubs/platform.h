@@ -52,7 +52,7 @@ static inline bool esp_timer_is_active(esp_timer_handle_t p) {return p->active;}
 #ifndef TEST_REAL_EVENT
 typedef const char *ts_event_base_t;
 typedef void *ts_event_handler_handle_t;
-typedef struct {void*data;size_t data_size;} ts_event_t;
+typedef struct {void*data;size_t data_size;int id;} ts_event_t;
 #define TS_EVENT_BASE_SYSTEM "system"
 #define TS_EVENT_BASE_DEVICE_MON "device"
 #define TS_EVENT_BASE_OTA "ota"

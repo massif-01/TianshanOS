@@ -1,5 +1,6 @@
 #include "ts_ws_transport.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdlib.h>
@@ -22,12 +23,15 @@ static struct {
 static ts_ws_peer_t s_peers[TS_WS_CONNECTIONS];
 static int s_log_levels[TS_WS_CONNECTIONS];
 static uint64_t s_log_revisions[TS_WS_CONNECTIONS];
-struct ts_ws_message { unsigned refs; char *text; size_t len, capacity; };
+typedef enum {MSG_ORDINARY, MSG_TOPIC, MSG_RESULT, MSG_POWER, MSG_POWER_TICK} message_kind_t;
+struct ts_ws_message { unsigned refs; char *text; size_t len, capacity; message_kind_t kind; };
+static char s_power_payloads[TS_WS_POWER_SLOTS][TS_WS_POWER_BYTES];
+static unsigned s_power_bytes;
 static ts_ws_transport_stats_t s_tx_stats;
 static ts_ws_message_t s_messages[TS_WS_ALL_MESSAGE_SLOTS];
 typedef enum {TX_FREE, TX_RESERVED, TX_PREPARED, TX_QUEUED, TX_EXECUTING, TX_DONE, TX_CANCELED} tx_state_t;
 typedef struct {
-    unsigned refs;
+    unsigned refs, retries;
     tx_state_t state;
     uint64_t order;
     ts_ws_peer_t peer;
@@ -128,21 +132,25 @@ esp_err_t ts_ws_peer_open(httpd_req_t *req, ts_ws_peer_t *peer)
     req->free_ctx = session_free; /* RST, LRU and httpd_stop also release this. */
     return ESP_OK;
 }
-static ts_ws_message_t *message_alloc(size_t capacity, unsigned kind)
+static ts_ws_message_t *message_alloc(size_t capacity, message_kind_t kind)
 {
+    if(kind>=MSG_POWER && capacity>TS_WS_POWER_BYTES)return NULL;
     ts_ws_message_t *m = NULL;
     portENTER_CRITICAL(&s_lock);
-    unsigned begin=kind==2 ? TS_WS_MESSAGE_SLOTS : kind==1 ? 0 : TS_WS_MESSAGE_SLOTS-2;
-    unsigned end=kind==2 ? TS_WS_ALL_MESSAGE_SLOTS : kind==1 ? TS_WS_MESSAGE_SLOTS-2 : TS_WS_MESSAGE_SLOTS;
-    for (unsigned i=begin; capacity <= TS_WS_TOTAL_BYTES-s_tx_stats.bytes && i<end; ++i) if (!s_messages[i].refs) {
-        m = &s_messages[i]; m->refs = 1; m->capacity = capacity;
+    unsigned begin=kind>=MSG_POWER ? TS_WS_MESSAGE_SLOTS+2+(kind==MSG_POWER_TICK?TS_WS_POWER_TRANSITIONS:0) : kind==MSG_RESULT ? TS_WS_MESSAGE_SLOTS : kind==MSG_TOPIC ? 0 : TS_WS_MESSAGE_SLOTS-2;
+    unsigned end=kind==MSG_POWER_TICK ? TS_WS_ALL_MESSAGE_SLOTS : kind==MSG_POWER ? TS_WS_ALL_MESSAGE_SLOTS-1 : kind==MSG_RESULT ? TS_WS_MESSAGE_SLOTS+2 : kind==MSG_TOPIC ? TS_WS_MESSAGE_SLOTS-2 : TS_WS_MESSAGE_SLOTS;
+    size_t used=kind>=MSG_POWER ? s_power_bytes : s_tx_stats.bytes-s_power_bytes;
+    size_t limit=kind>=MSG_POWER ? TS_WS_POWER_BUDGET : TS_WS_TOTAL_BYTES-TS_WS_POWER_BUDGET;
+    for (unsigned i=begin; capacity <= limit-used && i<end; ++i) if (!s_messages[i].refs) {
+        m = &s_messages[i]; m->refs = 1; m->capacity = capacity; m->kind=kind;
+        if(kind>=MSG_POWER)s_power_bytes+=capacity;
         s_tx_stats.bytes += capacity;
         if(s_tx_stats.bytes > s_tx_stats.bytes_high) s_tx_stats.bytes_high=s_tx_stats.bytes;
         break;
     }
     portEXIT_CRITICAL(&s_lock);
     if (m) {
-        m->text = malloc(capacity);
+        m->text = kind>=MSG_POWER ? s_power_payloads[m-s_messages-TS_WS_MESSAGE_SLOTS-2] : malloc(capacity);
         if (!m->text) {
             portENTER_CRITICAL(&s_lock);s_tx_stats.rejected++;portEXIT_CRITICAL(&s_lock);
             ts_ws_message_release(m);return NULL;
@@ -166,8 +174,9 @@ void ts_ws_message_release(ts_ws_message_t *m)
     }
     portEXIT_CRITICAL(&s_lock);
     if (!reclaim) return;
-    free(text);
+    if(m->kind<MSG_POWER)free(text);
     portENTER_CRITICAL(&s_lock);
+    if(m->kind>=MSG_POWER)s_power_bytes-=m->capacity;
     m->text = NULL;
     m->len = 0;
     s_tx_stats.bytes -= m->capacity;
@@ -220,6 +229,18 @@ static void delivery_release(delivery_t *d)
     portEXIT_CRITICAL(&s_lock);
     ts_ws_message_release(m);
 }
+/* Exactly one settlement for every accepted work reference, including stale
+ * targets and queue rejection. Class is owned by the message, never by done. */
+static void settle(delivery_t *d, esp_err_t result)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_tx_stats.settled++;
+    bool power=d->message->kind>=MSG_POWER;
+    if(power){s_tx_stats.power_settled++;if(result!=ESP_OK)s_tx_stats.power_failed++;}
+    portEXIT_CRITICAL(&s_lock);
+    if(d->message->kind>=MSG_RESULT && result!=ESP_OK)ESP_LOGW("ws_tx","Critical notification target failed: class=%d fd=%d result=%d",d->message->kind,d->peer.fd,result);
+    if(d->done)d->done(d->revision,d->delivery,result);
+}
 static void deliver(void *arg)
 {
     delivery_t *d = arg;
@@ -253,7 +274,7 @@ static void deliver(void *arg)
         portENTER_CRITICAL(&s_lock); s_tx_stats.stale++; portEXIT_CRITICAL(&s_lock);
     }
     TS_WS_TEST_POINT("sent");
-    if (d->done) d->done(d->revision, d->delivery, ret);
+    settle(d,ret);
     portENTER_CRITICAL(&s_lock);
     d->state=TX_DONE;
     s_server.work_busy=false;
@@ -268,19 +289,22 @@ static esp_err_t publish_delivery(delivery_t *d)
 {
     esp_err_t ret=httpd_queue_work(d->peer.server,deliver,d);
     portENTER_CRITICAL(&s_lock);
-    bool retry=ret!=ESP_OK && d>=&s_deliveries[TS_WS_TX_SLOTS];
+    bool retry=ret!=ESP_OK && d->message->kind>=MSG_RESULT && ++d->retries<TS_WS_QUEUE_RETRIES;
     if(ret==ESP_OK){s_tx_stats.queued++;s_server.retry_at=0;}
     else {
-        s_tx_stats.rejected++;s_server.work_busy=false;
+        s_tx_stats.rejected++;
         d->state=retry?TX_PREPARED:TX_CANCELED;
         if(retry)s_server.retry_at=esp_timer_get_time()+100000;
     }
     portEXIT_CRITICAL(&s_lock);
     if(ret!=ESP_OK){
         if(!retry) {
-            if(d->done)d->done(d->revision,d->delivery,ret);
+            settle(d,ret);
             delivery_release(d); /* failed ordinary work reference */
         }
+        /* A failure callback may enqueue its reserved terminal. Keep the
+         * executor busy until settlement ends to avoid recursive queue failures. */
+        portENTER_CRITICAL(&s_lock);s_server.work_busy=false;portEXIT_CRITICAL(&s_lock);
         ts_ws_subscriptions_wake();
     }
     delivery_release(d); /* publication reference, may outlive the callback */
@@ -315,18 +339,18 @@ static void cancel_ready(bool topics_only)
         bool cancel=d->state==TX_PREPARED && (!topics_only || i<TS_WS_TOPIC_TX_SLOTS);
         if(cancel){d->state=TX_CANCELED;s_tx_stats.stale++;} /* take its existing work reference */
         portEXIT_CRITICAL(&s_lock);
-        if(cancel){if(d->done)d->done(d->revision,d->delivery,ESP_ERR_INVALID_STATE);delivery_release(d);}
+        if(cancel){settle(d,ESP_ERR_INVALID_STATE);delivery_release(d);}
     }
 }
 void ts_ws_transport_cancel_topics(void){cancel_ready(true);}
 esp_err_t ts_ws_transport_submit(ts_ws_peer_t peer, ts_ws_message_t *message,
     uint64_t revision, uint64_t delivery, ts_ws_delivery_check_t check, ts_ws_delivery_done_t done)
 {
-    if(!message)return ESP_ERR_INVALID_ARG;
+    if(!message || message->kind>MSG_TOPIC)return ESP_ERR_INVALID_ARG;
     delivery_t *d=NULL;
     portENTER_CRITICAL(&s_lock);
     if(!s_server.stopping && peer_valid(peer) && s_delivery_order!=UINT64_MAX)
-        for(unsigned i=done?0:TS_WS_TOPIC_TX_SLOTS;i<(done?TS_WS_TOPIC_TX_SLOTS:TS_WS_TX_SLOTS);i++)if(!s_deliveries[i].refs){
+        for(unsigned i=message->kind==MSG_TOPIC?0:TS_WS_TOPIC_TX_SLOTS;i<(message->kind==MSG_TOPIC?TS_WS_TOPIC_TX_SLOTS:TS_WS_TX_SLOTS);i++)if(!s_deliveries[i].refs){
             d=&s_deliveries[i];
             *d=(delivery_t){.refs=2,.state=TX_PREPARED,.order=++s_delivery_order,.peer=peer,
                 .message=message,.revision=revision,.delivery=delivery,.check=check,.done=done};
@@ -436,7 +460,7 @@ unsigned ts_ws_message_capacity(void)
 {
     unsigned n=0;
     portENTER_CRITICAL(&s_lock);
-    if(s_tx_stats.bytes <= TS_WS_TOTAL_BYTES - TS_WS_FRAME_BYTES)
+    if(s_tx_stats.bytes-s_power_bytes <= TS_WS_TOTAL_BYTES-TS_WS_POWER_BUDGET-TS_WS_FRAME_BYTES)
         for(unsigned i=0;i<TS_WS_MESSAGE_SLOTS-2;i++) n+=!s_messages[i].refs;
     portEXIT_CRITICAL(&s_lock);
     return n;
@@ -493,14 +517,15 @@ unsigned ts_ws_peer_snapshot(ts_ws_peer_t *peers, unsigned capacity)
     portEXIT_CRITICAL(&s_lock);
     return n;
 }
-esp_err_t ts_ws_reserve(const ts_ws_peer_t *peers, unsigned count, bool result,
+static esp_err_t reserve_kind(const ts_ws_peer_t *peers, unsigned count, message_kind_t kind,
                         size_t bytes, ts_ws_reservation_t *r)
 {
-    if(!r || (!peers && !result) || !count || count>TS_WS_RESERVATION_TARGETS || !bytes || bytes>TS_WS_LEGACY_BYTES) return ESP_ERR_INVALID_ARG;
+    if(!r || (!peers && kind!=MSG_RESULT) || !count || count>TS_WS_RESERVATION_TARGETS || !bytes || bytes>TS_WS_LEGACY_BYTES) return ESP_ERR_INVALID_ARG;
     *r=(ts_ws_reservation_t){0};
-    ts_ws_message_t *m=message_alloc(bytes,result?2:1);
+    ts_ws_message_t *m=message_alloc(bytes,kind);
     if(!m) return ESP_ERR_NO_MEM;
-    unsigned begin=result?TS_WS_TX_SLOTS:0, end=result?TS_WS_ALL_TX_SLOTS:TS_WS_TOPIC_TX_SLOTS;
+    unsigned begin=kind>=MSG_POWER ? TS_WS_RESULT_TX_END+(kind==MSG_POWER_TICK?TS_WS_POWER_TRANSITIONS*TS_WS_CONNECTIONS:0) : kind==MSG_RESULT?TS_WS_TX_SLOTS:0;
+    unsigned end=kind==MSG_POWER_TICK?TS_WS_ALL_TX_SLOTS:kind==MSG_POWER?TS_WS_ALL_TX_SLOTS-TS_WS_CONNECTIONS:kind==MSG_RESULT?TS_WS_RESULT_TX_END:TS_WS_TOPIC_TX_SLOTS;
     portENTER_CRITICAL(&s_lock);
     bool valid=!s_server.stopping && s_server.handle;
     for(unsigned i=0;peers && i<count;i++) if(!peer_valid(peers[i])) valid=false;
@@ -517,6 +542,10 @@ esp_err_t ts_ws_reserve(const ts_ws_peer_t *peers, unsigned count, bool result,
     portEXIT_CRITICAL(&s_lock);
     if(!r->message){ts_ws_message_release(m);return valid?ESP_ERR_NO_MEM:ESP_ERR_INVALID_STATE;}
     return ESP_OK;
+}
+esp_err_t ts_ws_reserve(const ts_ws_peer_t *peers,unsigned count,bool result,size_t bytes,ts_ws_reservation_t *r)
+{
+    return reserve_kind(peers,count,result?MSG_RESULT:MSG_TOPIC,bytes,r);
 }
 void ts_ws_reservation_release(ts_ws_reservation_t *r)
 {
@@ -573,6 +602,11 @@ esp_err_t ts_ws_result_broadcast(ts_ws_reservation_t *r,const char *text)
     if(ret!=ESP_OK)return ret;
     ts_ws_peer_t peers[TS_WS_CONNECTIONS];
     unsigned n=ts_ws_peer_snapshot(peers,TS_WS_CONNECTIONS);
+    return ts_ws_result_publish(r,peers,n);
+}
+esp_err_t ts_ws_result_publish(ts_ws_reservation_t *r,const ts_ws_peer_t *peers,unsigned n)
+{
+    esp_err_t ret=ESP_OK;
     for(unsigned i=0;i<n;i++) {
         if(i>=r->count || r->slots[i]<0)return ESP_ERR_INVALID_STATE;
         portENTER_CRITICAL(&s_lock);s_deliveries[r->slots[i]].peer=peers[i];portEXIT_CRITICAL(&s_lock);
@@ -588,4 +622,28 @@ uint32_t ts_ws_transport_retry_ms(void)
     int64_t delta=s_server.retry_at-esp_timer_get_time();
     portEXIT_CRITICAL(&s_lock);
     return delta>0 ? (uint32_t)((delta+999)/1000) : 0;
+}
+
+esp_err_t ts_ws_power_reserve(bool tick,ts_ws_reservation_t *r)
+{
+    *r=(ts_ws_reservation_t){0};
+    ts_ws_peer_t peers[TS_WS_CONNECTIONS];
+    unsigned n=ts_ws_peer_snapshot(peers,TS_WS_CONNECTIONS);
+    if(!n)return ESP_OK;
+    esp_err_t ret=reserve_kind(peers,n,tick?MSG_POWER_TICK:MSG_POWER,TS_WS_POWER_BYTES,r);
+    portENTER_CRITICAL(&s_lock);
+    if(ret==ESP_OK)s_tx_stats.power_accepted++;else s_tx_stats.power_rejected++;
+    portEXIT_CRITICAL(&s_lock);
+    return ret;
+}
+esp_err_t ts_ws_power_publish(ts_ws_reservation_t *r,const char *text)
+{
+    if(!r->message)return ESP_OK; /* no recipients at admission */
+    esp_err_t ret=ts_ws_reserved_text(r,text);
+    if(ret!=ESP_OK)return ret;
+    for(unsigned i=0;i<r->count;i++) {
+        esp_err_t result=ts_ws_reserved_submit(r,i,0,0,NULL,NULL);
+        if(result!=ESP_OK){ret=result;portENTER_CRITICAL(&s_lock);s_tx_stats.power_failed++;portEXIT_CRITICAL(&s_lock);}
+    }
+    return ret;
 }

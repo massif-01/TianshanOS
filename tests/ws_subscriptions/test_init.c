@@ -22,6 +22,9 @@ static int ts_ws_subscriptions_init(void){return fail_stage==3?ESP_ERR_NO_MEM:ES
 static esp_err_t ts_webui_ws_stop(httpd_handle_t server);
 static int manager_stop_result,barrier_result,tx_stop_result,tx_stop_calls;
 static bool owner_context,s_exec_running,s_ssh_poll_alive,cleanup_finishes;
+static atomic_bool s_exec_result_active,s_exec_output_failed,s_exec_terminal_ready;
+static atomic_uint s_ssh_output_pending,s_ssh_result_pending;
+static atomic_bool s_exec_terminal_claimed;
 static atomic_uint s_exec_creators;
 bool ts_ws_transport_in_context(void){return owner_context;}
 static esp_err_t ts_ws_subscriptions_deinit(void){return manager_stop_result;}
