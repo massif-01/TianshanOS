@@ -372,6 +372,12 @@ esp_err_t ts_event_register_with_priority(ts_event_base_t event_base,
  */
 esp_err_t ts_event_unregister(ts_event_handler_handle_t handle);
 
+/** Stop new invocations and drain existing callbacks. Timeout retains the handle
+ * for retry; only ESP_OK / NOT_FOUND permits freeing user_data. Never call from
+ * an event callback (including post_sync); use nonblocking unregister there. */
+esp_err_t ts_event_unregister_sync(ts_event_handler_handle_t handle, uint32_t timeout_ms);
+bool ts_event_in_callback(void);
+
 /**
  * @brief 取消注册指定事件的所有处理器
  *

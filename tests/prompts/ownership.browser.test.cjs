@@ -271,3 +271,33 @@ test('R1: delayed sign-out does not clear a newer sign-in',async()=>{
   });assert(r.clearedImmediately&&r.confirmed);assert.equal(r.token,'new');
  }finally{await context.close();}
 });
+
+for (const language of ['zh-CN','en-US']) {
+ test(`WS protocol: actual page subscription class, independent intervals and acknowledgements ${language}`,async()=>{
+  const first=await pageFor(language),second=await pageFor(language);
+  try {
+   await Promise.all([first.page.goto(base),second.page.goto(base)]);
+   await Promise.all([first.page.waitForFunction(()=>i18n.isReady()),second.page.waitForFunction(()=>i18n.isReady())]);
+   async function exercise(page,interval) {
+    return page.evaluate(interval=>{
+     const sent=[],received=[];
+     const mgr=new SubscriptionManager({send:message=>sent.push(message)});
+     const callback=message=>received.push(message.data);
+     mgr.subscribe('system.cpu',callback,{interval});
+     mgr.handleMessage({type:'subscribed',topic:'system.cpu',success:true});
+     mgr.handleMessage({type:'data',topic:'system.cpu',data:{usage:12},timestamp:1});
+     mgr.unsubscribe('system.cpu',callback);
+     mgr.handleMessage({type:'unsubscribed',topic:'system.cpu',success:true});
+     mgr.handleMessage({type:'data',topic:'system.cpu',data:{usage:99},timestamp:2});
+     return {sent,received,active:mgr.activeSubs.size};
+    },interval);
+   }
+   const [a,b]=await Promise.all([exercise(first.page,1000),exercise(second.page,10000)]);
+   assert.equal(a.sent[0].params.interval,1000);assert.equal(b.sent[0].params.interval,10000);
+   for(const result of [a,b]) {
+    assert.deepEqual(result.received,[{usage:12}]);assert.equal(result.active,0);
+    assert.deepEqual(result.sent[1],{type:'unsubscribe',topic:'system.cpu'});
+   }
+  }finally{await first.context.close();await second.context.close();}
+ });
+}

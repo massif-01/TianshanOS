@@ -143,7 +143,8 @@ esp_err_t ts_service_deinit(void)
     ESP_LOGI(TAG, "Deinitializing service management...");
 
     // 停止所有服务
-    ts_service_stop_all();
+    esp_err_t ret = ts_service_stop_all();
+    if (ret != ESP_OK) return ret;
 
     xSemaphoreTake(s_svc_ctx.mutex, portMAX_DELAY);
 
@@ -380,7 +381,8 @@ esp_err_t ts_service_stop_all(void)
             if (service->def.phase == phase && 
                 service->state == TS_SERVICE_STATE_RUNNING) {
                 xSemaphoreGive(s_svc_ctx.mutex);
-                ts_service_stop(service);
+                esp_err_t ret = ts_service_stop(service);
+                if (ret != ESP_OK) return ret; /* keep dependencies and registry for retry */
                 xSemaphoreTake(s_svc_ctx.mutex, portMAX_DELAY);
             }
             service = service->next;
