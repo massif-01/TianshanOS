@@ -490,7 +490,8 @@ esp_err_t ts_service_restart(ts_service_handle_t handle)
     ESP_LOGI(TAG, "Restarting service: %s", service->def.name);
 
     esp_err_t ret = ts_service_stop(handle);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    if (ret != ESP_OK && (ret != ESP_ERR_INVALID_STATE ||
+                         service->state == TS_SERVICE_STATE_RUNNING)) {
         return ret;
     }
 
@@ -910,7 +911,9 @@ static esp_err_t stop_service_internal(ts_service_instance_t *service)
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Service '%s' stop returned error: %s", 
                      service->def.name, esp_err_to_name(ret));
-            // 继续停止流程
+            /* Failed stop retains the service and its resources for a later retry. */
+            set_service_state(service, old_state);
+            return ret;
         }
     }
 

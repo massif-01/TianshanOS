@@ -166,6 +166,9 @@ typedef struct {
 #define TS_EVENT_BASE_OTA       "ts_ota"
 
 /** 时间事件 */
+#define TS_EVENT_BASE_PKI       "ts_pki"
+#define TS_EVENT_PKI_MATERIAL_CHANGED 0x0001
+
 #define TS_EVENT_BASE_TIME      "ts_time"
 
 /* ============================================================================

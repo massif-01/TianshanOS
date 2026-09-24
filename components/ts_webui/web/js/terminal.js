@@ -10,36 +10,30 @@
 const _xtermReady = (function() {
     let _promise = null;
 
-    function loadCSS(href) {
-        return new Promise(function(resolve, reject) {
-            if (document.querySelector('link[href="' + href + '"]')) { resolve(); return; }
-            var link = document.createElement('link');
-            link.rel = 'stylesheet';
-            link.href = href;
-            link.onload = resolve;
-            link.onerror = reject;
-            document.head.appendChild(link);
+    function loadResource(url, css) {
+        return new Promise((resolve, reject) => {
+            const selector = css ? 'link[href="' + url + '"]' : 'script[src="' + url + '"]';
+            const existing = document.querySelector(selector);
+            if (existing?.dataset.ready === 'true') { resolve(); return; }
+            if (existing) existing.remove();
+            const node = document.createElement(css ? 'link' : 'script');
+            if (css) { node.rel = 'stylesheet'; node.href = url; } else node.src = url;
+            const timer = setTimeout(() => finish(false), 15000);
+            function finish(ok) {
+                clearTimeout(timer); node.onload = node.onerror = null;
+                if (ok) { node.dataset.ready = 'true'; resolve(); }
+                else { node.remove(); reject(new Error('Terminal resource unavailable: ' + url)); }
+            }
+            node.onload = () => finish(true); node.onerror = () => finish(false);
+            document.head.appendChild(node);
         });
     }
-    function loadScript(src) {
-        return new Promise(function(resolve, reject) {
-            if (document.querySelector('script[src="' + src + '"]')) { resolve(); return; }
-            var s = document.createElement('script');
-            s.src = src;
-            s.onload = resolve;
-            s.onerror = reject;
-            document.head.appendChild(s);
-        });
-    }
-
     return function ensureXtermLoaded() {
         if (_promise) return _promise;
-        if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
-            return (_promise = Promise.resolve());
-        }
-        _promise = loadCSS('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css')
-            .then(function() { return loadScript('https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js'); })
-            .then(function() { return loadScript('https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js'); });
+        _promise = loadResource('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css', true)
+            .then(() => loadResource('https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js', false))
+            .then(() => loadResource('https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js', false))
+            .catch(error => { _promise = null; throw error; });
         return _promise;
     };
 })();
@@ -60,6 +54,9 @@ class WebTerminal {
         // SSH Shell 模式
         this.sshMode = false;
         this.sshConnecting = false;
+        this.restoring = false;
+        this.restoreTimer = null;
+        this.destroyed = false;
     }
 
     /**
@@ -73,7 +70,18 @@ class WebTerminal {
         }
 
         // 按需加载 xterm.js（首次访问终端页面时从 CDN 拉取）
-        await _xtermReady();
+        try { await _xtermReady(); }
+        catch (error) {
+            if (this.destroyed) return false;
+            console.error(error);
+            container.replaceChildren();
+            const message = document.createElement('p'); message.textContent = t('promptRepair.terminalLoadFailed');
+            const retry = document.createElement('button'); retry.className = 'btn'; retry.textContent = t('promptRepair.retry');
+            retry.onclick = () => loadTerminalPage();
+            container.append(message, retry);
+            return false;
+        }
+        if (this.destroyed) return false;
 
         // 创建 xterm.js 终端
         this.terminal = new Terminal({
@@ -297,6 +305,7 @@ class WebTerminal {
      * 连接到 WebSocket
      */
     connect() {
+        if (this.destroyed) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
         
@@ -328,6 +337,7 @@ class WebTerminal {
         this.ws.onclose = (event) => {
             console.log('Terminal WebSocket disconnected, code:', event.code);
             this.connected = false;
+            if (this.restoring) this.finishRestore(false);
             
             // 清除心跳
             if (this.pingInterval) {
@@ -341,7 +351,7 @@ class WebTerminal {
             if (event.code !== 1000) { // 非正常关闭
                 this.writeln('\x1b[33m' + (typeof t === 'function' ? t('terminal.reconnectIn') : '5秒后尝试重新连接...') + '\x1b[0m');
                 const tryReconnect = () => {
-                    if (this.connected) return;
+                    if (this.destroyed || this.connected) return;
                     if (document.visibilityState !== 'visible') {
                         document.addEventListener('visibilitychange', function handler() {
                             document.removeEventListener('visibilitychange', handler);
@@ -365,9 +375,18 @@ class WebTerminal {
     /**
      * 处理 WebSocket 消息
      */
+    finishRestore(ok, timeout = false) {
+        clearTimeout(this.restoreTimer); this.restoreTimer = null;
+        this.restoring = false;
+        const key = ok ? 'terminalRestored' : timeout ? 'terminalRestoreTimeout' : 'terminalRestoreFailed';
+        this.writeln(t('promptRepair.' + key));
+        showToast(t('promptRepair.' + key), ok ? 'success' : 'warning');
+    }
+
     handleMessage(msg) {
         switch (msg.type) {
             case 'connected':
+                if (this.restoring) this.finishRestore(true);
                 this.connected = true;
                 this.prompt = msg.prompt || 'tianshan> ';
                 this.writeln('\x1b[1;32m' + (typeof t === 'function' ? t('terminal.connected') : '已连接到设备') + '\x1b[0m');
@@ -391,10 +410,14 @@ class WebTerminal {
             case 'error': {
                 const errMsg = msg.message || (typeof t === 'function' ? t('terminal.unknownError') : '未知错误');
                 if (errMsg.indexOf('Not a terminal session') >= 0 && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({ type: 'terminal_start' }));
-                    const toast = typeof showToast === 'function' ? showToast : function(m) { console.log(m); };
-                    toast(typeof t === 'function' ? t('terminal.sessionRestored') : '会话已恢复，请重试', 'success');
+                    if (!this.restoring) {
+                        this.restoring = true; this.connected = false;
+                        this.ws.send(JSON.stringify({type: 'terminal_start'}));
+                        showToast(t('promptRepair.terminalRestoring'), 'info');
+                        this.restoreTimer = setTimeout(() => this.finishRestore(false, true), 10000);
+                    }
                 } else {
+                    if (this.restoring) this.finishRestore(false);
                     this.writeln('\x1b[1;31m' + (typeof t === 'function' ? t('terminal.errorLabel') : '错误') + ': ' + errMsg + '\x1b[0m');
                     this.writePrompt();
                 }
@@ -686,6 +709,7 @@ class WebTerminal {
      * 断开连接
      */
     disconnect() {
+        clearTimeout(this.restoreTimer); this.restoring = false;
         // 清除心跳
         if (this.pingInterval) {
             clearInterval(this.pingInterval);
@@ -707,6 +731,7 @@ class WebTerminal {
      * 销毁终端
      */
     destroy() {
+        this.destroyed = true;
         this.disconnect();
         if (this.terminal) {
             this.terminal.dispose();

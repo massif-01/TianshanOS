@@ -581,7 +581,7 @@ static void handle_terminal_command(httpd_req_t *req, const char *command)
         return;
     }
     
-    TS_LOGD(TAG, "Terminal exec: %s", command);
+    TS_LOGD(TAG, "Terminal exec (%u bytes)", (unsigned)strlen(command));
     
     // 清空输出缓冲区
     if (s_output_mutex && xSemaphoreTake(s_output_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {

@@ -66,6 +66,6 @@ if(EXISTS "${WEB_SRC_DIR}")
     add_custom_target(optimize_web ALL DEPENDS ${FINAL_STAMP})
 
     # 从优化后的构建目录创建 SPIFFS 镜像
-    spiffs_create_partition_image(www ${WEB_BUILD_DIR} FLASH_IN_PROJECT)
+    spiffs_create_partition_image(www ${WEB_BUILD_DIR} FLASH_IN_PROJECT DEPENDS optimize_web)
 
 endif()
