@@ -60,6 +60,7 @@ typedef enum {
 
 typedef struct {
     atomic_bool active;
+    ts_ws_peer_t peer; /* HTTPD owner writes the connection registry */
     atomic_int fd;
     _Atomic(httpd_handle_t) hd;
     _Atomic(ws_client_type_t) type;
@@ -273,7 +274,7 @@ static void ssh_poll_task(void *arg)
 }
 static void ssh_cleanup(void)
 {
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);
+    ts_ws_operation_t *op=ts_ws_op_shell_owner();
     if(!op)return;
     ssh_close(op,"closed","SSH session closed");
     ts_ws_op_release(op);
@@ -318,34 +319,33 @@ failed:
     set_client_role(peer,WS_CLIENT_TYPE_TERMINAL,TS_LOG_NONE);
     ts_ws_op_executor_done(op);
 }
-/* Input borrows the original context. Cleanup takes the same resource mutex;
- * the lifecycle lock is never held across SSH I/O. */
-static void handle_ssh_input(const char *data)
+/* Page control has one ownership gate. The acquired original context remains
+ * pinned across resource I/O; no handler can retarget the current Shell. */
+static void handle_ssh_control(httpd_req_t *req,ts_ws_peer_t peer,const char *type,cJSON *msg)
 {
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);if(!op)return;
+    ts_ws_operation_t *op=ts_ws_op_shell_control(peer);
+    if(!op){ssh_request_error(req,"This connection does not own an active SSH session");return;}
     ssh_shell_context_t *ctx=ts_ws_op_data(op);
-    if(ctx && data){xSemaphoreTake(ctx->io,portMAX_DELAY);if(ctx->shell && ts_ws_op_is_open(op))ts_ssh_shell_write(ctx->shell,data,strlen(data),NULL);xSemaphoreGive(ctx->io);}
-    ts_ws_op_release(op);
-}
-static void handle_ssh_disconnect(void)
-{
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);if(!op)return;
-    ssh_shell_context_t *ctx=ts_ws_op_data(op);
-    if(ctx)ctx->disconnect_requested=true;
-    ts_ws_op_release(op);
-}
-static void handle_ssh_signal(const char *signal)
-{
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);if(!op)return;
-    ssh_shell_context_t *ctx=ts_ws_op_data(op);
-    if(ctx && signal){xSemaphoreTake(ctx->io,portMAX_DELAY);if(ctx->shell && ts_ws_op_is_open(op))ts_ssh_shell_send_signal(ctx->shell,signal);xSemaphoreGive(ctx->io);}
-    ts_ws_op_release(op);
-}
-static void handle_ssh_resize(int width,int height)
-{
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);if(!op)return;
-    ssh_shell_context_t *ctx=ts_ws_op_data(op);
-    if(ctx && width>0 && height>0){xSemaphoreTake(ctx->io,portMAX_DELAY);if(ctx->shell && ts_ws_op_is_open(op))ts_ssh_shell_resize(ctx->shell,width,height);xSemaphoreGive(ctx->io);}
+    if(!strcmp(type,"ssh_disconnect"))ctx->disconnect_requested=true;
+    else {
+        esp_err_t ret=ESP_ERR_INVALID_STATE;
+        xSemaphoreTake(ctx->io,portMAX_DELAY);
+        if(ctx->shell && ts_ws_op_is_open(op)) {
+            if(!strcmp(type,"ssh_input")) {
+                cJSON *data=cJSON_GetObjectItem(msg,"data");
+                if(cJSON_IsString(data))ret=ts_ssh_shell_write(ctx->shell,data->valuestring,strlen(data->valuestring),NULL);
+            } else if(!strcmp(type,"ssh_signal")) {
+                cJSON *signal=cJSON_GetObjectItem(msg,"signal");
+                if(cJSON_IsString(signal))ret=ts_ssh_shell_send_signal(ctx->shell,signal->valuestring);
+            } else {
+                cJSON *w=cJSON_GetObjectItem(msg,"width"),*h=cJSON_GetObjectItem(msg,"height");
+                if(cJSON_IsNumber(w) && cJSON_IsNumber(h) && w->valueint>0 && h->valueint>0)
+                    ret=ts_ssh_shell_resize(ctx->shell,w->valueint,h->valueint);
+            }
+        }
+        xSemaphoreGive(ctx->io);
+        if(ret!=ESP_OK)ssh_request_error(req,"SSH control could not be completed for this session");
+    }
     ts_ws_op_release(op);
 }
 
@@ -376,7 +376,7 @@ static void terminal_output_cb(const char *data, size_t len, void *user_data)
 }
 
 /* 前向声明 */
-static void cleanup_disconnected_client(int fd);
+static void cleanup_disconnected_client(ts_ws_peer_t peer);
 
 static esp_err_t add_client(httpd_req_t *req, ws_client_type_t type)
 {
@@ -384,6 +384,7 @@ static esp_err_t add_client(httpd_req_t *req, ws_client_type_t type)
     esp_err_t ret = ts_ws_peer_open(req, &peer);
     if (ret != ESP_OK) return ret;
     for (int i = 0; i < MAX_WS_CLIENTS; ++i) if (!s_clients[i].active) {
+        s_clients[i].peer = peer;
         s_clients[i].fd = peer.fd;
         s_clients[i].hd = peer.server;
         s_clients[i].type = type;
@@ -488,10 +489,12 @@ static void start_terminal_session(httpd_req_t *req)
         // 检查旧的终端 fd 是否还在活跃客户端列表中
         bool old_fd_active = false;
         httpd_handle_t old_hd = NULL;
+        ts_ws_peer_t old_peer={0};
         for (int i = 0; i < MAX_WS_CLIENTS; i++) {
             if (s_clients[i].active && s_clients[i].fd == s_terminal_client_fd) {
                 old_fd_active = true;
                 old_hd = s_clients[i].hd;
+                old_peer=s_clients[i].peer;
                 break;
             }
         }
@@ -526,7 +529,7 @@ static void start_terminal_session(httpd_req_t *req)
             }
             
             // 清理旧会话
-            cleanup_disconnected_client(s_terminal_client_fd);
+            cleanup_disconnected_client(old_peer);
             s_terminal_client_fd = -1;
             
             // 短暂延迟确保关闭消息发送
@@ -568,19 +571,18 @@ static void start_terminal_session(httpd_req_t *req)
 }
 
 /* 清理断开的客户端 */
-static void cleanup_disconnected_client(int fd)
+static void cleanup_disconnected_client(ts_ws_peer_t peer)
 {
     bool was_log_client = false;
-    
-    // 清理订阅（新增）
-    ts_ws_peer_t peer;
-    if (ts_ws_peer_get(s_server, fd, &peer)) {
+    int fd=peer.fd;
+    ts_ws_peer_t live;
+    if(ts_ws_peer_get(peer.server,peer.fd,&live) && ts_ws_peer_equal(live,peer)) {
         ts_ws_peer_close(peer);
         return;
     }
-    
+
     for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-        if (s_clients[i].active && s_clients[i].fd == fd) {
+        if (s_clients[i].active && ts_ws_peer_equal(s_clients[i].peer,peer)) {
             // 如果是终端客户端，清理输出回调
             if (s_clients[i].type == WS_CLIENT_TYPE_TERMINAL && s_terminal_client_fd == fd) {
                 ts_console_clear_output_cb();
@@ -608,9 +610,9 @@ static void cleanup_disconnected_client(int fd)
 static void peer_closed(ts_ws_peer_t peer)
 {
     ts_ws_client_disconnected(peer);
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_SHELL,0);
-    if(op){if(ts_ws_peer_equal(ts_ws_op_peer(op),peer))ssh_close(op,"closed","SSH session closed");ts_ws_op_release(op);}
-    cleanup_disconnected_client(peer.fd);
+    ts_ws_operation_t *op=ts_ws_op_shell_connection(peer);
+    if(op){ssh_close(op,"closed","SSH session closed");ts_ws_op_release(op);}
+    cleanup_disconnected_client(peer);
 }
 
 static esp_err_t ws_handler(httpd_req_t *req)
@@ -634,14 +636,14 @@ static esp_err_t ws_handler(httpd_req_t *req)
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
         TS_LOGD(TAG, "ws_recv_frame error: %s", esp_err_to_name(ret));
-        cleanup_disconnected_client(httpd_req_to_sockfd(req));
+        cleanup_disconnected_client(peer);
         return ret;
     }
     
     // 处理关闭帧
     if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
         TS_LOGD(TAG, "WebSocket close frame received");
-        cleanup_disconnected_client(httpd_req_to_sockfd(req));
+        cleanup_disconnected_client(peer);
         return ESP_OK;
     }
     
@@ -661,7 +663,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
     
     ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
     if (ret != ESP_OK) {
-        cleanup_disconnected_client(httpd_req_to_sockfd(req));
+        cleanup_disconnected_client(peer);
         free(buf);
         return ret;
     }
@@ -791,31 +793,9 @@ static esp_err_t ws_handler(httpd_req_t *req)
                 // SSH 连接请求
                 handle_ssh_connect(req, msg);
             }
-            else if (strcmp(type->valuestring, "ssh_input") == 0) {
-                // SSH 输入
-                cJSON *data = cJSON_GetObjectItem(msg, "data");
-                if (data && cJSON_IsString(data)) {
-                    handle_ssh_input(data->valuestring);
-                }
-            }
-            else if (strcmp(type->valuestring, "ssh_disconnect") == 0) {
-                // SSH 断开
-                handle_ssh_disconnect();
-            }
-            else if (strcmp(type->valuestring, "ssh_signal") == 0) {
-                // SSH 信号 (如 INT, TERM)
-                cJSON *sig = cJSON_GetObjectItem(msg, "signal");
-                if (sig && cJSON_IsString(sig)) {
-                    handle_ssh_signal(sig->valuestring);
-                }
-            }
-            else if (strcmp(type->valuestring, "ssh_resize") == 0) {
-                // SSH 窗口大小调整
-                cJSON *width = cJSON_GetObjectItem(msg, "width");
-                cJSON *height = cJSON_GetObjectItem(msg, "height");
-                if (width && height && cJSON_IsNumber(width) && cJSON_IsNumber(height)) {
-                    handle_ssh_resize(width->valueint, height->valueint);
-                }
+            else if (!strcmp(type->valuestring,"ssh_input") || !strcmp(type->valuestring,"ssh_disconnect") ||
+                     !strcmp(type->valuestring,"ssh_signal") || !strcmp(type->valuestring,"ssh_resize")) {
+                handle_ssh_control(req,peer,type->valuestring,msg);
             }
             /* 日志流订阅 */
             else if (strcmp(type->valuestring, "log_subscribe") == 0) {
@@ -1227,7 +1207,7 @@ typedef struct {
     ts_ssh_session_t session;
     SemaphoreHandle_t io;
     TimerHandle_t timer;
-    atomic_bool cancel_requested, timer_closing;
+    atomic_bool timer_closing;
     atomic_uint timer_phase; /* 0 none, 1 live, 2 delete, 3 barrier, 4 queued, 5 drained */
     atomic_uint timer_retries;
     int64_t timer_retry_at; /* maintenance worker owns pacing */
@@ -1539,8 +1519,7 @@ static void ssh_exec_output_callback(const char *data, size_t len, bool is_stder
             if (should_stop) {
                 TS_LOGI(TAG, "Aborting SSH execution (pattern=%d, first_extract=%d)",
                         pattern_matched, is_first_extract);
-                params->cancel_requested = true;
-                exec_abort(params);
+                if(ts_ws_op_request_stop(params->op,OP_STOP_MATCH))exec_abort(params);
             }
         }
     }
@@ -1554,8 +1533,7 @@ static void ssh_exec_timeout_callback(TimerHandle_t timer)
     ssh_exec_task_params_t *params=pvTimerGetTimerID(timer);
     xSemaphoreTake(params->io,portMAX_DELAY);
     if(!params->timer_closing) {
-        params->cancel_requested=true;
-        if(params->session)ts_ssh_abort(params->session);
+        if(ts_ws_op_request_stop(params->op,OP_STOP_TIMEOUT) && params->session)ts_ssh_abort(params->session);
     }
     xSemaphoreGive(params->io);
 }
@@ -1619,8 +1597,8 @@ static void ssh_exec_task(void *arg)
     char *key_buf = NULL;
     size_t key_len = 0;
     
-    /* 重置取消请求标志 */
-    /* Initialized by the creator before exposing the original context. */
+    ts_ws_stop_reason_t stop_reason=OP_STOP_NONE;
+    if(ts_ws_op_cancelled(params->op)){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
     
     TS_LOGI(TAG, "SSH exec task started: session_id=%lu, cmd=%s", 
             (unsigned long)session_id, params->command);
@@ -1635,6 +1613,8 @@ static void ssh_exec_task(void *arg)
             params->config.auth.key.private_key_path = NULL;
             params->config.auth.key.passphrase = NULL;
         } else {
+            stop_reason=ts_ws_op_business_end(params->op,false);
+            if(stop_reason){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
             TS_LOGE(TAG, "Failed to load key '%s': %s", params->keyid, esp_err_to_name(ret));
             /* 发送错误消息 */
             if(ts_ws_op_close_begin(params->op)) {
@@ -1651,11 +1631,15 @@ static void ssh_exec_task(void *arg)
         }
     }
     
+    if(ts_ws_op_cancelled(params->op)){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
+
     /* 创建 SSH 会话 */
     ts_ssh_session_t created=NULL;
     ret = ts_ssh_session_create(&params->config, &created);
     xSemaphoreTake(params->io,portMAX_DELAY);params->session=created;xSemaphoreGive(params->io);
     if (ret != ESP_OK) {
+        stop_reason=ts_ws_op_business_end(params->op,false);
+        if(stop_reason){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
         TS_LOGE(TAG, "Failed to create SSH session: %s", esp_err_to_name(ret));
         if(ts_ws_op_close_begin(params->op)) {
         cJSON *msg = cJSON_CreateObject();
@@ -1673,6 +1657,8 @@ static void ssh_exec_task(void *arg)
     /* 连接 */
     ret = ts_ssh_connect(params->session);
     if (ret != ESP_OK) {
+        stop_reason=ts_ws_op_business_end(params->op,ret==ESP_ERR_TIMEOUT);
+        if(stop_reason)goto execution_finished;
         const char *err = ts_ssh_get_error(params->session);
         TS_LOGE(TAG, "SSH connect failed: %s", err ? err : "unknown");
         if(ts_ws_op_close_begin(params->op)) {
@@ -1688,6 +1674,8 @@ static void ssh_exec_task(void *arg)
         goto cleanup;
     }
     
+    if(ts_ws_op_cancelled(params->op)){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
+
     /* 发送开始消息 */
     {
         ts_ws_output_ticket_t start_ticket;
@@ -1737,12 +1725,18 @@ static void ssh_exec_task(void *arg)
         } else ts_ws_op_release(params->op);
     }
 
-    /* 流式执行命令 */
+    /* This lock-ordered claim is the conservative irreversible boundary.
+     * After it, cancellation is cooperative: remote execution may have begun. */
+    if(!ts_ws_op_claim_submit(params->op)){ret=ESP_ERR_TIMEOUT;goto execution_finished;}
     ret = ts_ssh_exec_stream(params->session, params->command,
                               ssh_exec_output_callback, 
                               params,
                               &exit_code);
     
+execution_finished:
+    TS_WS_TEST_POINT("C04");
+    stop_reason=ts_ws_op_business_end(params->op,ret==ESP_ERR_TIMEOUT);
+    TS_WS_TEST_POINT("C05");
     xSemaphoreTake(params->io,portMAX_DELAY);params->timer_closing=true;xSemaphoreGive(params->io);
     if(params->timer_phase==1){params->timer_phase=2;ts_ws_subscriptions_wake();}
 
@@ -1750,7 +1744,7 @@ static void ssh_exec_task(void *arg)
     ts_webui_ssh_status_t status = TS_WEBUI_SSH_STATUS_SUCCESS;
     
     /* 检查是否因超时被取消 */
-    bool was_timeout = params->cancel_requested && (ret == ESP_ERR_TIMEOUT);
+    bool was_timeout = stop_reason==OP_STOP_TIMEOUT;
     
     /* 优先使用实时匹配结果 */
     bool expect_matched = params->expect_matched;
@@ -1758,7 +1752,11 @@ static void ssh_exec_task(void *arg)
     char *extracted_value = params->extracted_value;
     params->extracted_value = NULL;  /* 转移所有权，避免重复释放 */
     
-    if (was_timeout && !params->match_found) {
+    if(stop_reason==OP_STOP_USER) {
+        status=TS_WEBUI_SSH_STATUS_CANCELLED;
+    } else if(stop_reason==OP_STOP_MATCH) {
+        status=params->fail_matched?TS_WEBUI_SSH_STATUS_MATCH_FAILED:TS_WEBUI_SSH_STATUS_MATCH_SUCCESS;
+    } else if (was_timeout && !params->match_found) {
         /* 超时且未匹配成功 */
         status = TS_WEBUI_SSH_STATUS_TIMEOUT;
         TS_LOGW(TAG, "SSH exec timed out without match");
@@ -1956,6 +1954,7 @@ static void ssh_exec_task(void *arg)
     }
 
 cleanup:
+    ts_ws_op_business_end(params->op,false);
     /* 清理密钥缓冲区 */
     if (key_buf) {
         memset(key_buf, 0, key_len);
@@ -2000,6 +1999,8 @@ static esp_err_t ts_webui_ssh_exec_start_ex_impl(ts_ws_operation_t *op, const ch
 
     /* 配置 SSH */
     params->config = (ts_ssh_config_t)TS_SSH_DEFAULT_CONFIG();
+    params->config.cancelled=ts_ws_op_cancelled;
+    params->config.cancel_context=op;
     params->config.host = strdup(host);
     params->config.port = port;
     params->config.username = strdup(user);
@@ -2199,19 +2200,17 @@ void ts_webui_ssh_result_free(ts_webui_ssh_result_t *result)
 
 esp_err_t ts_webui_ssh_exec_cancel(uint32_t session_id)
 {
-    if(!session_id)return ESP_ERR_INVALID_STATE;
-    ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_EXEC,session_id);
+    ts_ws_operation_t *op=ts_ws_op_cancel_exec(session_id);
     if(!op)return ESP_ERR_INVALID_STATE;
     ssh_exec_task_params_t *params=ts_ws_op_data(op);
-    bool running=ts_ws_op_executing(op);
-    if(params && running)exec_abort(params);
+    exec_abort(params); /* intent is already persistent, even without a session */
     ts_ws_op_release(op);
-    return running?ESP_OK:ESP_ERR_INVALID_STATE;
+    return ESP_OK; /* accepted request, not remote termination confirmation */
 }
 
 bool ts_webui_ssh_exec_is_running(uint32_t session_id)
 {
     ts_ws_operation_t *op=ts_ws_op_acquire(TS_WS_OP_EXEC,session_id);
     if(!op)return false;
-    bool running=ts_ws_op_executing(op);ts_ws_op_release(op);return running;
+    bool running=ts_ws_op_business_running(op);ts_ws_op_release(op);return running;
 }

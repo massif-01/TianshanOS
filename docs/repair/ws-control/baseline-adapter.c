@@ -168,7 +168,7 @@ static void stop_progress_shell(void){
 }
 static void operation_cross_tests(void){
     uint32_t id;ts_ws_op_stats_t ledger;
-    setup();connect_shell();unsigned dc=disconnecting_frames;incoming="{\"type\":\"ssh_disconnect\"}";reqs[1].method=1;current=(void*)3;assert(ws_handler(&reqs[1])==ESP_OK);current=(void*)1;incoming=NULL;shell_task.fn(shell_task.arg);finish_all();assert(disconnecting_frames==dc+1);
+    setup();connect_shell();unsigned dc=disconnecting_frames;handle_ssh_disconnect();shell_task.fn(shell_task.arg);finish_all();assert(disconnecting_frames==dc+1);
     setup();terminal_frames=output_frames=0;output_after_terminal=false;connect_shell();
     ssh_shell_context_t *ctx=shell_task.arg;paused_id=ts_ws_op_id(ctx->op);
     ts_ws_message_t *m=ts_ws_message_text("block",5);

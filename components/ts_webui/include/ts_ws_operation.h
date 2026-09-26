@@ -45,3 +45,17 @@ void ts_ws_op_stats(ts_ws_op_kind_t kind, ts_ws_op_stats_t *stats);
 
 void ts_ws_op_set_maintenance(ts_ws_operation_t *op,bool (*maintain)(void *));
 bool ts_ws_op_needs_tick(void);
+
+/* Control ownership is separate from observation state. Page controls never use
+ * wildcard acquire. Owner shutdown and exact-ID business cancellation differ. */
+ts_ws_operation_t *ts_ws_op_shell_control(ts_ws_peer_t peer);
+ts_ws_operation_t *ts_ws_op_shell_owner(void);
+ts_ws_operation_t *ts_ws_op_shell_connection(ts_ws_peer_t peer);
+typedef enum { OP_STOP_NONE=0, OP_STOP_USER=1, OP_STOP_TIMEOUT=2, OP_STOP_MATCH=4 } ts_ws_stop_reason_t;
+typedef enum { OP_BUSINESS_PREPARING, OP_BUSINESS_SUBMITTED, OP_BUSINESS_ENDED } ts_ws_business_phase_t;
+ts_ws_operation_t *ts_ws_op_cancel_exec(uint32_t id);
+bool ts_ws_op_request_stop(ts_ws_operation_t *op,ts_ws_stop_reason_t reason);
+bool ts_ws_op_cancelled(void *context);
+bool ts_ws_op_claim_submit(ts_ws_operation_t *op);
+ts_ws_stop_reason_t ts_ws_op_business_end(ts_ws_operation_t *op,bool deadline);
+bool ts_ws_op_business_running(ts_ws_operation_t *op);

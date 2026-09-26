@@ -11,6 +11,10 @@ struct ts_ws_operation {
     ts_ws_op_stats_t ledger;
     ts_ws_op_kind_t kind;
     bool initializing, builder;
+    bool business_accepted;
+    ts_ws_business_phase_t business;
+    ts_ws_stop_reason_t first_stop;
+    unsigned stop_reasons;
     ts_ws_peer_t peer, terminal_peers[TS_WS_CONNECTIONS];
     unsigned terminal_count;
     ts_ws_reservation_t terminal;
@@ -75,7 +79,7 @@ void ts_ws_op_executor_done(ts_ws_operation_t *op) {
 }
 bool ts_ws_op_executing(ts_ws_operation_t *op) { OP_LOCK();bool yes=op->ledger.executors!=0;OP_UNLOCK();return yes; }
 bool ts_ws_op_open(ts_ws_operation_t *op) {
-    OP_LOCK();bool yes=op->ledger.phase==OP_STARTING;if(yes)op->ledger.phase=OP_OPEN;OP_UNLOCK();return yes;
+    OP_LOCK();bool yes=op->ledger.phase==OP_STARTING;if(yes){op->ledger.phase=OP_OPEN;op->business_accepted=true;}OP_UNLOCK();return yes;
 }
 bool ts_ws_op_is_open(ts_ws_operation_t *op) { OP_LOCK();bool yes=op->ledger.phase==OP_OPEN;OP_UNLOCK();return yes; }
 bool ts_ws_op_starting(ts_ws_operation_t *op) { OP_LOCK();bool yes=op->ledger.phase==OP_STARTING;OP_UNLOCK();return yes; }
@@ -215,3 +219,58 @@ void ts_ws_op_poll(void) {
     OP_LOCK();s_op_tick=tick;OP_UNLOCK();
 }
 void ts_ws_op_stats(ts_ws_op_kind_t kind,ts_ws_op_stats_t *stats) {OP_LOCK();*stats=s_ops[kind].ledger;OP_UNLOCK();}
+
+/* All identity checks, reference acquisition and control decisions linearize
+ * under the same operation lock. No resource or network work under this lock. */
+static ts_ws_operation_t *shell_for_peer(ts_ws_peer_t peer,bool control) {
+    OP_LOCK();ts_ws_operation_t *op=&s_ops[TS_WS_OP_SHELL];
+    if(op->initializing || op->ledger.phase==OP_FREE || op->ledger.phase==OP_RECLAIMING ||
+       (control && op->ledger.phase!=OP_OPEN) || !ts_ws_peer_equal(op->peer,peer))op=NULL;
+    else op->ledger.refs++;
+    OP_UNLOCK();return op;
+}
+ts_ws_operation_t *ts_ws_op_shell_control(ts_ws_peer_t peer) {
+    ts_ws_operation_t *op=shell_for_peer(peer,true);TS_WS_TEST_POINT("C01");return op;
+}
+ts_ws_operation_t *ts_ws_op_shell_connection(ts_ws_peer_t peer) {
+    return shell_for_peer(peer,false);
+}
+ts_ws_operation_t *ts_ws_op_shell_owner(void) {
+    return ts_ws_op_acquire(TS_WS_OP_SHELL,0); /* service/connection owner only */
+}
+static bool request_stop_locked(ts_ws_operation_t *op,ts_ws_stop_reason_t reason) {
+    if(op->kind!=TS_WS_OP_EXEC || !op->business_accepted || op->business==OP_BUSINESS_ENDED)return false;
+    op->stop_reasons|=reason;
+    if(!op->first_stop)op->first_stop=reason;
+    return true;
+}
+ts_ws_operation_t *ts_ws_op_cancel_exec(uint32_t id) {
+    OP_LOCK();ts_ws_operation_t *op=&s_ops[TS_WS_OP_EXEC];
+    if(!id || op->ledger.phase==OP_FREE || op->ledger.phase==OP_RECLAIMING ||
+       op->ledger.identity!=id || !request_stop_locked(op,OP_STOP_USER))op=NULL;
+    else op->ledger.refs++;
+    OP_UNLOCK();return op;
+}
+bool ts_ws_op_request_stop(ts_ws_operation_t *op,ts_ws_stop_reason_t reason) {
+    OP_LOCK();bool accepted=request_stop_locked(op,reason);OP_UNLOCK();return accepted;
+}
+bool ts_ws_op_cancelled(void *context) {
+    ts_ws_operation_t *op=context;OP_LOCK();bool yes=op->stop_reasons!=0;OP_UNLOCK();return yes;
+}
+bool ts_ws_op_claim_submit(ts_ws_operation_t *op) {
+    TS_WS_TEST_POINT("C02");OP_LOCK();
+    bool yes=op->business_accepted && op->business==OP_BUSINESS_PREPARING && !op->stop_reasons;
+    if(yes)op->business=OP_BUSINESS_SUBMITTED;
+    OP_UNLOCK();TS_WS_TEST_POINT("C03");return yes;
+}
+ts_ws_stop_reason_t ts_ws_op_business_end(ts_ws_operation_t *op,bool deadline) {
+    OP_LOCK();
+    if(op->business!=OP_BUSINESS_ENDED){
+        if(deadline && !op->first_stop)request_stop_locked(op,OP_STOP_TIMEOUT);
+        op->business=OP_BUSINESS_ENDED;
+    }
+    ts_ws_stop_reason_t reason=op->first_stop;OP_UNLOCK();return reason;
+}
+bool ts_ws_op_business_running(ts_ws_operation_t *op) {
+    OP_LOCK();bool yes=op->business_accepted && op->business!=OP_BUSINESS_ENDED;OP_UNLOCK();return yes;
+}

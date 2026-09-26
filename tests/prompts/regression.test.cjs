@@ -81,6 +81,12 @@ for(const lang of ['zh-CN','en-US']) {
         h.run('currentExecSessionId=17;toastDeadline=0;');h.ctx.handleSshExecMessage({type:'ssh_exec_done',session_id:17,status,exit_code,fail_matched});
         assert.equal(h.el('toast').textContent,h.ctx.t('promptRepair.'+key));assert.equal(h.el('match-final-status').textContent,h.ctx.t('promptRepair.'+key));
     }
+    h.run('currentExecSessionId=17;toastDeadline=0;');
+    h.ctx.handleSshExecMessage({type:'ssh_exec_cancelled',session_id:17});
+    assert.equal(h.run('currentExecSessionId'),null);
+    assert(h.el('exec-result').textContent.includes(h.ctx.t('promptRepair.sshCancelOutput')));
+    assert.match(h.el('exec-result').textContent,lang==='zh-CN'?/远端命令是否终止尚未确认/:/remote command termination is not confirmed/);
+    assert.equal(h.el('toast').textContent,h.ctx.t('toast.commandCancelled'));
     assert.equal(h.ctx.sshTerminalResult({status:'match_failed',success:true}).key,'sshUnknown');
     h.run('currentExecSessionId=17;toastDeadline=0;');h.ctx.handleSshExecMessage({type:'ssh_exec_match',session_id:17,is_final:true,fail_matched:true});
     assert.equal(h.el('toast').textContent,h.ctx.t('promptRepair.sshFailureOutput'));

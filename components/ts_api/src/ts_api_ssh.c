@@ -545,24 +545,19 @@ static esp_err_t api_ssh_cancel(const cJSON *params, ts_api_result_t *result)
 {
     const cJSON *sid = cJSON_GetObjectItem(params, "session_id");
     
-    uint32_t session_id = 0;
-    if (sid && cJSON_IsNumber(sid)) {
-        session_id = (uint32_t)sid->valueint;
-    }
-    
-    /* 检查会话是否在运行 */
-    if (!ts_webui_ssh_exec_is_running(session_id)) {
+    /* Exact instance identity; a status wildcard is never a control target. */
+    if (!cJSON_IsNumber(sid) || sid->valuedouble < 1 || sid->valuedouble > UINT32_MAX ||
+        sid->valuedouble != (double)(uint32_t)sid->valuedouble) {
         ts_api_result_error(result, TS_API_ERR_NOT_FOUND, "No running session");
         return ESP_ERR_NOT_FOUND;
     }
-    
-    /* 取消执行 */
-    esp_err_t ret = ts_webui_ssh_exec_cancel(session_id);
+    esp_err_t ret = ts_webui_ssh_exec_cancel((uint32_t)sid->valuedouble);
     if (ret != ESP_OK) {
-        ts_api_result_error(result, TS_API_ERR_INTERNAL, "Failed to cancel");
+        ts_api_result_error(result, ret == ESP_ERR_INVALID_STATE ? TS_API_ERR_NOT_FOUND : TS_API_ERR_INTERNAL,
+                            ret == ESP_ERR_INVALID_STATE ? "No running session" : "Failed to request cancellation");
         return ret;
     }
-    
+    /* Existing wire field means accepted intent, not confirmed remote exit. */
     cJSON *data = cJSON_CreateObject();
     cJSON_AddBoolToObject(data, "cancelled", true);
     ts_api_result_ok(result, data);
