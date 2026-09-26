@@ -1,3 +1,5 @@
+> 后续项目级契约修复与当前本地验收见 [v3 记录](../ws-project-v3/README.md)。本文件保留上一轮历史证据，不替代 v3 结论。
+
 # PR #42：控制请求归属与业务取消统一修复
 
 修改前基线为 `1591ecc8e293c0fa62feda18d2517edfc179ca5a`。实现阶段仅本地修改与验证；用户随后另行授权提交、推送并更新 PR #42，见 publication-gate.md。本轮没有改版本/发布流程或操作设备。既有 output/、tmp/、另一份未跟踪 reviewer diff-check 保留。

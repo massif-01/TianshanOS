@@ -68,11 +68,15 @@ static int adapter_create_caps(void(*fn)(void*),const char *n,unsigned stack,voi
 #undef heap_caps_calloc
 #undef xTaskCreate
 #undef xTaskCreateWithCaps
+#ifndef PROJECT_REAL_DRIVER
 struct ts_ssh_session_s {bool aborted;ts_ssh_config_t config;};
+#endif
 static unsigned control_writes,control_signals,control_resizes,commands_submitted;
 static void (*stage_hook)(const char *);
 static void stage(const char *name){if(stage_hook)stage_hook(name);}
+#ifndef PROJECT_REAL_DRIVER
 struct ts_ssh_shell_s {bool active;};
+#endif
 static unsigned aborts,variable_writes,session_destroys;
 static int remote_failure;
 static void (*remote_hook)(void);
@@ -92,6 +96,7 @@ BaseType_t xTimerPendFunctionCall(void(*fn)(void*,uint32_t),void *arg,uint32_t v
  assert(timer_queued<16);timer_queue[timer_queued++]=(typeof(timer_queue[0])){fn,arg,v,NULL};return pdPASS;
 }
 static void timer_pump(void){while(timer_queued){typeof(timer_queue[0]) q=timer_queue[0];memmove(timer_queue,timer_queue+1,--timer_queued*sizeof(*timer_queue));if(q.deleted){free(q.deleted);host_timer=NULL;}else q.fn(q.arg,q.value);}}
+#ifndef PROJECT_REAL_DRIVER
 esp_err_t ts_ssh_session_create(const ts_ssh_config_t*c,ts_ssh_session_t *out){stage("create");if(remote_failure==1)return ESP_FAIL;*out=host_calloc(1,sizeof(**out));if(*out)(*out)->config=*c;return *out?ESP_OK:ESP_ERR_NO_MEM;}
 esp_err_t ts_ssh_connect(ts_ssh_session_t s){stage("connect");if(s->config.cancelled && s->config.cancelled(s->config.cancel_context))return ESP_ERR_TIMEOUT;stage("auth");return remote_failure==2?ESP_FAIL:ESP_OK;}
 const char *ts_ssh_get_error(ts_ssh_session_t s){(void)s;return "fake network error";}
@@ -100,6 +105,7 @@ esp_err_t ts_ssh_session_destroy(ts_ssh_session_t s){session_destroys++;tracked_
 void ts_ssh_abort(ts_ssh_session_t s){s->aborted=true;aborts++;}
 esp_err_t ts_ssh_shell_open(ts_ssh_session_t s,const ts_shell_config_t*c,ts_ssh_shell_t *out){(void)s;(void)c;if(remote_failure==3)return ESP_FAIL;*out=host_calloc(1,sizeof(**out));(*out)->active=true;return 0;}
 bool ts_ssh_shell_is_active(ts_ssh_shell_t s){return s&&s->active;}
+ts_shell_state_t ts_ssh_shell_get_state(ts_ssh_shell_t s){return s&&s->active?TS_SHELL_STATE_RUNNING:TS_SHELL_STATE_CLOSED;}
 esp_err_t ts_ssh_shell_close(ts_ssh_shell_t s){tracked_free(s);return 0;}
 esp_err_t ts_ssh_shell_read(ts_ssh_shell_t s,char *b,size_t n,size_t *out){(void)b;(void)n;*out=0;s->active=false;return 0;}
 esp_err_t ts_ssh_shell_write(ts_ssh_shell_t s,const char *b,size_t n,size_t *out){(void)s;(void)b;(void)n;(void)out;control_writes++;return 0;}
@@ -109,6 +115,9 @@ esp_err_t ts_ssh_exec_stream(ts_ssh_session_t s,const char *command,ts_ssh_outpu
  (void)command;stage("submit");if(s->config.cancelled && s->config.cancelled(s->config.cancel_context))return ESP_ERR_TIMEOUT;commands_submitted++;if(remote_hook)remote_hook();if(remote_timeout && host_timer)host_timer->fn(host_timer);
  cb("value=42\n",9,false,arg);*code=0;return s->aborted || (s->config.cancelled && s->config.cancelled(s->config.cancel_context))?ESP_ERR_TIMEOUT:ESP_OK;
 }
+#else
+#include "project_driver.inc"
+#endif
 esp_err_t ts_keystore_load_private_key(const char *id,char **out,size_t *n){(void)id;stage("key");*out=host_strdup("fake-key");*n=9;return ESP_OK;}
 esp_err_t ts_variable_upsert(const ts_auto_variable_t *v){(void)v;variable_writes++;return 0;}
 esp_err_t ts_console_exec(const char *cmd,ts_cmd_result_t *result){(void)cmd;memset(result,0,sizeof(*result));return 0;}
@@ -121,7 +130,11 @@ esp_err_t ts_log_remove_callback(ts_log_callback_handle_t h){(void)h;return remo
 size_t ts_log_buffer_search(ts_log_entry_t *e,size_t n,ts_log_level_t min,ts_log_level_t max,const char *tag,const char *keyword){(void)e;(void)n;(void)min;(void)max;(void)tag;(void)keyword;return 0;}
 httpd_handle_t ts_http_server_get_handle(void){return (void*)11;}
 void ts_http_server_set_stop_hooks(esp_err_t(*stop)(httpd_handle_t),void(*stopped)(httpd_handle_t)){(void)stop;(void)stopped;}
-static int adapter_create_caps(void(*fn)(void*),const char*n,unsigned stack,void*arg,unsigned p,TaskHandle_t*out,unsigned caps){(void)caps;if(close_during_create)((ssh_shell_context_t*)arg)->shell->active=false;return adapter_create(fn,n,stack,arg,p,out);}
+static int adapter_create_caps(void(*fn)(void*),const char*n,unsigned stack,void*arg,unsigned p,TaskHandle_t*out,unsigned caps){(void)caps;
+#ifndef PROJECT_REAL_DRIVER
+if(close_during_create)((ssh_shell_context_t*)arg)->shell->active=false;
+#endif
+return adapter_create(fn,n,stack,arg,p,out);}
 static void drive_all(void){for(unsigned i=0;i<12;i++){ts_ws_op_poll();pump();timer_pump();}assert(!timer_queued);}
 static void setup(void){start();memset(s_clients,0,sizeof(s_clients));s_server=(void*)11;s_ws_stopping=false;ts_ws_op_enable();transport_server.closed=peer_closed;for(int fd=1;fd<=2;fd++){reqs[fd]=(httpd_req_t){.handle=(void*)11,.fd=fd};current=(void*)3;assert(add_client(&reqs[fd],WS_CLIENT_TYPE_EVENT)==ESP_OK);}current=(void*)1;}
 static void finish_all(void){drive_all();assert(!ts_ws_op_busy());stop();assert(!live_allocations);}

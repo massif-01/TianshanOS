@@ -412,7 +412,6 @@ static const char *shell_input_callback(size_t *out_len, void *user_data)
         } else if (ch == 0x1C) {  /* Ctrl+\ - 退出 Shell */
             ts_console_printf("\n^\\  (Exit shell)\n");
             ts_console_request_interrupt();
-            ts_ssh_shell_request_close(shell);
             return NULL;
         }
         

@@ -54,6 +54,7 @@ class WebTerminal {
         // SSH Shell 模式
         this.sshMode = false;
         this.sshConnecting = false;
+        this.sshDisconnecting = false;
         this.restoring = false;
         this.restoreTimer = null;
         this.destroyed = false;
@@ -149,7 +150,7 @@ class WebTerminal {
      */
     setupInputHandler() {
         this.terminal.onData(data => {
-            if (!this.connected) return;
+            if (!this.connected || this.sshConnecting || this.sshDisconnecting) return;
             
             // SSH Shell 模式
             if (this.sshMode) {
@@ -306,26 +307,31 @@ class WebTerminal {
      */
     connect() {
         if (this.destroyed) return;
+        if (this.ws) this.disconnect();
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
         
-        this.ws = new WebSocket(wsUrl);
+        const ws = new WebSocket(wsUrl);
+        this.ws = ws;
+        const current = () => !this.destroyed && this.ws === ws;
         this.pingInterval = null;
         
-        this.ws.onopen = () => {
+        ws.onopen = () => {
+            if (!current()) return;
             console.log('Terminal WebSocket connected');
             // 发送终端启动请求
-            this.ws.send(JSON.stringify({ type: 'terminal_start' }));
+            ws.send(JSON.stringify({ type: 'terminal_start' }));
             
             // 启动心跳机制
             this.pingInterval = setInterval(() => {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({ type: 'ping' }));
+                if (current() && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping' }));
                 }
             }, 15000); // 每15秒发送心跳
         };
         
-        this.ws.onmessage = (event) => {
+        ws.onmessage = (event) => {
+            if (!current()) return;
             try {
                 const msg = JSON.parse(event.data);
                 this.handleMessage(msg);
@@ -334,9 +340,11 @@ class WebTerminal {
             }
         };
         
-        this.ws.onclose = (event) => {
+        ws.onclose = (event) => {
+            if (!current()) return;
             console.log('Terminal WebSocket disconnected, code:', event.code);
             this.connected = false;
+            this.sshMode = this.sshConnecting = this.sshDisconnecting = false;
             if (this.restoring) this.finishRestore(false);
             
             // 清除心跳
@@ -351,7 +359,7 @@ class WebTerminal {
             if (event.code !== 1000) { // 非正常关闭
                 this.writeln('\x1b[33m' + (typeof t === 'function' ? t('terminal.reconnectIn') : '5秒后尝试重新连接...') + '\x1b[0m');
                 const tryReconnect = () => {
-                    if (this.destroyed || this.connected) return;
+                    if (!current() || this.connected) return;
                     if (document.visibilityState !== 'visible') {
                         document.addEventListener('visibilitychange', function handler() {
                             document.removeEventListener('visibilitychange', handler);
@@ -366,7 +374,8 @@ class WebTerminal {
             }
         };
         
-        this.ws.onerror = (error) => {
+        ws.onerror = (error) => {
+            if (!current()) return;
             console.error('Terminal WebSocket error:', error);
             this.writeln('\r\n\x1b[1;31m' + (typeof t === 'function' ? t('terminal.connectionError') : '连接错误') + '\x1b[0m');
         };
@@ -384,8 +393,10 @@ class WebTerminal {
     }
 
     handleMessage(msg) {
+        if (this.destroyed) return;
         switch (msg.type) {
             case 'connected':
+                if (this.sshMode || this.sshConnecting || this.sshDisconnecting) return;
                 if (this.restoring) this.finishRestore(true);
                 this.connected = true;
                 this.prompt = msg.prompt || 'tianshan> ';
@@ -403,18 +414,25 @@ class WebTerminal {
                 break;
                 
             case 'done':
+                if (this.sshMode || this.sshConnecting || this.sshDisconnecting) return;
                 // 命令执行完成
                 this.writePrompt();
                 break;
                 
             case 'error': {
                 const errMsg = msg.message || (typeof t === 'function' ? t('terminal.unknownError') : '未知错误');
+                if (this.sshMode || this.sshConnecting || this.sshDisconnecting) {
+                    this.writeln('\x1b[1;31m' + this.sshMessageText(errMsg) + '\x1b[0m');
+                    if (this.sshConnecting && !this.sshMode) { this.sshConnecting = false; this.writePrompt(); }
+                    break; // request failure is not an operation terminal
+                }
                 if (errMsg.indexOf('Not a terminal session') >= 0 && this.ws && this.ws.readyState === WebSocket.OPEN) {
                     if (!this.restoring) {
                         this.restoring = true; this.connected = false;
                         this.ws.send(JSON.stringify({type: 'terminal_start'}));
                         showToast(t('promptRepair.terminalRestoring'), 'info');
-                        this.restoreTimer = setTimeout(() => this.finishRestore(false, true), 10000);
+                        const restoringSocket = this.ws;
+                        this.restoreTimer = setTimeout(() => { if (!this.destroyed && this.ws === restoringSocket && this.restoring) this.finishRestore(false, true); }, 10000);
                     }
                 } else {
                     if (this.restoring) this.finishRestore(false);
@@ -446,6 +464,7 @@ class WebTerminal {
             
             case 'session_closed':
                 this.connected = false;
+                this.sshMode = this.sshConnecting = this.sshDisconnecting = false;
                 this.writeln('\x1b[33m' + (typeof t === 'function' ? t('terminal.sessionClosed') : '会话已关闭，请重新连接') + '\x1b[0m');
                 break;
                 
@@ -593,10 +612,9 @@ class WebTerminal {
     startSshShell(params) {
         if (this.sshConnecting || this.sshMode) {
             this.writeln('\x1b[1;31m' + (typeof t === 'function' ? t('terminal.sshSessionInProgress') : 'SSH 会话已在进行中') + '\x1b[0m');
-            this.writePrompt();
             return;
         }
-        
+        if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         this.sshConnecting = true;
         const connMsg = typeof t === 'function' ? t('terminal.sshConnectingTo', { user: params.user, host: params.host, port: params.port }) : `正在连接到 ${params.user}@${params.host}:${params.port}...`;
         this.writeln(`\x1b[36m${connMsg}\x1b[0m`);
@@ -627,29 +645,66 @@ class WebTerminal {
     /**
      * 处理 SSH 状态消息
      */
+    sshMessageText(message) {
+        const keys = {
+            "Missing host or user": "sshShellRequiresParams",
+            "SSH result delivery capacity unavailable": "sshCapacity",
+            "Failed to create SSH session": "sshCreateFailed",
+            "Failed to open shell": "sshOpenFailed",
+            "SSH shell closed during startup": "sshStartupClosed",
+            "SSH connection status delivery failed": "sshStatusFailed",
+            "SSH readiness delivery failed": "sshStatusFailed",
+            "SSH status delivery failed": "sshStatusFailed",
+            "SSH output delivery incomplete; remote command result is not confirmed": "sshOutputIncomplete",
+            "SSH session closed": "sshClosed",
+            "Closing SSH session...": "sshClosing",
+            "Connecting to SSH server...": "sshConnecting",
+            "SSH shell ready": "sshReady",
+            "Service is stopping": "sshServiceStopping",
+            'Unsupported SSH signal': 'sshControlUnsupported',
+            'Invalid SSH control parameters': 'sshControlInvalid',
+            'SSH control request failed; input was not replayed': 'sshControlFailed',
+            'SSH channel failed; remote result is not confirmed': 'sshChannelUnknown',
+            'This connection does not own an active SSH session': 'sshWrongOwner',
+            'Another SSH session is active': 'sshBusy',
+            'SSH request rejected': 'sshRequestRejected'
+        };
+        return keys[message] && typeof t === 'function' ? t('terminal.' + keys[message]) : message;
+    }
+
     handleSshStatus(msg) {
         const status = msg.status;
-        const message = msg.message || '';
+        const message = this.sshMessageText(msg.message || '');
         
         switch (status) {
             case 'connecting':
                 this.writeln(`\x1b[33m${message}\x1b[0m`);
                 break;
             case 'connected':
+                if (!this.sshConnecting) return;
+                this.sshDisconnecting = false;
                 this.sshMode = true;
                 this.sshConnecting = false;
                 this.writeln(`\x1b[1;32m${message}\x1b[0m`);
                 this.writeln('\x1b[90m' + (typeof t === 'function' ? t('terminal.exitSshHint') : '(按 Ctrl+\\ 退出 SSH shell)') + '\x1b[0m');
                 this.writeln('');
                 break;
-            case 'closed':
             case 'disconnecting':
+                if (!this.sshMode) return;
+                this.sshDisconnecting = true;
+                this.writeln(`\r\n\x1b[33m${message}\x1b[0m`);
+                break;
+            case 'closed':
+                if (!this.sshMode && !this.sshConnecting) return;
+                this.sshDisconnecting = false;
                 this.sshMode = false;
                 this.sshConnecting = false;
                 this.writeln(`\r\n\x1b[33m${message}\x1b[0m`);
                 this.writePrompt();
                 break;
             case 'error':
+                if (!this.sshMode && !this.sshConnecting) return;
+                this.sshDisconnecting = false;
                 this.sshMode = false;
                 this.sshConnecting = false;
                 this.writeln(`\x1b[1;31m${message}\x1b[0m`);
@@ -725,6 +780,7 @@ class WebTerminal {
             this.ws = null;
         }
         this.connected = false;
+        this.sshMode = this.sshConnecting = this.sshDisconnecting = false;
     }
 
     /**

@@ -3663,6 +3663,25 @@ if (typeof i18n !== 'undefined') i18n.registerLanguage('zh-CN', {
 
     // 终端页面
     terminal: {
+        sshCapacity: "结果通知通道暂时繁忙，本次 SSH 连接未启动，请稍后重试。",
+        sshCreateFailed: "未能创建 SSH 会话，请稍后重试。",
+        sshOpenFailed: "未能启动远端交互式终端，请检查远端是否允许此类连接。",
+        sshStartupClosed: "SSH 会话在启动期间已结束，请检查远端状态后重新连接。",
+        sshStatusFailed: "SSH 状态通知未能完成，连接状态尚未确认，请重新连接。",
+        sshOutputIncomplete: "网页 SSH 输出不完整，远端执行结果尚未确认。请检查远端状态，不要直接重发命令。",
+        sshClosed: "SSH 会话已结束。",
+        sshClosing: "正在结束 SSH 会话，请等待确认。",
+        sshConnecting: "正在建立 SSH 连接…",
+        sshReady: "SSH 交互式终端已就绪。",
+        sshServiceStopping: "服务正在停止，本次请求未被接受。",
+        sshControlUnsupported: "不支持此 SSH 信号，会话仍可继续使用。",
+        sshControlInvalid: "SSH 控制参数无效，会话仍可继续使用。",
+        sshControlFailed: "本次 SSH 请求失败，输入未自动重发。",
+        sshChannelUnknown: "SSH 通道异常结束，远端执行结果尚未确认。",
+        sshWrongOwner: "此连接不属于当前有效的 SSH 会话。",
+        sshBusy: "已有 SSH 会话，本次连接请求未被接受。",
+        sshRequestRejected: "本次 SSH 请求未被接受。",
+
         connecting: '正在连接到设备...',
         connected: '已连接到设备',
         helpHint: '输入 {help} 查看可用命令',

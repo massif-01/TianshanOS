@@ -179,11 +179,11 @@ static void power_policy_event_handler(const ts_event_t *event, void *user_data)
 /* Request errors must go to the requester, never mutate an existing session. */
 static void ssh_request_error(httpd_req_t *req, const char *message)
 {
+    TS_WS_TEST_POINT("request_error_encode");
     cJSON *msg=cJSON_CreateObject();
-    bool ok=msg && cJSON_AddStringToObject(msg,"type","ssh_status") &&
-        cJSON_AddStringToObject(msg,"status","error") && cJSON_AddStringToObject(msg,"message",message);
+    bool ok=msg && cJSON_AddStringToObject(msg,"type","error") && cJSON_AddStringToObject(msg,"message",message);
     char *json=ok?cJSON_PrintUnformatted(msg):NULL;cJSON_Delete(msg);
-    const char *text=json?json:"{\"type\":\"ssh_status\",\"status\":\"error\",\"message\":\"SSH request rejected\"}";
+    const char *text=json?json:"{\"type\":\"error\",\"message\":\"SSH request rejected\"}";
     httpd_ws_frame_t frame={.type=HTTPD_WS_TYPE_TEXT,.payload=(uint8_t*)text,.len=strlen(text)};
     esp_err_t ret=httpd_ws_send_frame(req,&frame);
     if(ret!=ESP_OK)TS_LOGW(TAG,"SSH request error could not be sent: %s",esp_err_to_name(ret));
@@ -263,9 +263,10 @@ static void ssh_poll_task(void *arg)
         xSemaphoreTake(ctx->io,portMAX_DELAY);
         esp_err_t ret=ts_ssh_shell_read(ctx->shell,buf,sizeof(buf)-1,&n);
         bool active=ts_ssh_shell_is_active(ctx->shell);
+        bool failed=ts_ssh_shell_get_state(ctx->shell)==TS_SHELL_STATE_ERROR;
         xSemaphoreGive(ctx->io);
         if(ret==ESP_OK && n)ssh_send_output(ctx,buf,n);
-        if(!active){ssh_close(op,"closed","SSH session closed");break;}
+        if(!active){ssh_close(op,failed?"error":"closed",failed?"SSH channel failed; remote result is not confirmed":"SSH session closed");break;}
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     shell_resources_close(ctx);
@@ -328,9 +329,10 @@ static void handle_ssh_control(httpd_req_t *req,ts_ws_peer_t peer,const char *ty
     ssh_shell_context_t *ctx=ts_ws_op_data(op);
     if(!strcmp(type,"ssh_disconnect"))ctx->disconnect_requested=true;
     else {
-        esp_err_t ret=ESP_ERR_INVALID_STATE;
+        esp_err_t ret=ESP_ERR_INVALID_ARG;bool active=false;
         xSemaphoreTake(ctx->io,portMAX_DELAY);
         if(ctx->shell && ts_ws_op_is_open(op)) {
+            active=true;
             if(!strcmp(type,"ssh_input")) {
                 cJSON *data=cJSON_GetObjectItem(msg,"data");
                 if(cJSON_IsString(data))ret=ts_ssh_shell_write(ctx->shell,data->valuestring,strlen(data->valuestring),NULL);
@@ -339,12 +341,18 @@ static void handle_ssh_control(httpd_req_t *req,ts_ws_peer_t peer,const char *ty
                 if(cJSON_IsString(signal))ret=ts_ssh_shell_send_signal(ctx->shell,signal->valuestring);
             } else {
                 cJSON *w=cJSON_GetObjectItem(msg,"width"),*h=cJSON_GetObjectItem(msg,"height");
-                if(cJSON_IsNumber(w) && cJSON_IsNumber(h) && w->valueint>0 && h->valueint>0)
+                if(cJSON_IsNumber(w) && cJSON_IsNumber(h) && w->valuedouble>=1 && w->valuedouble<=UINT16_MAX && h->valuedouble>=1 && h->valuedouble<=UINT16_MAX &&
+                   w->valuedouble==w->valueint && h->valuedouble==h->valueint)
                     ret=ts_ssh_shell_resize(ctx->shell,w->valueint,h->valueint);
             }
         }
+        if(ctx->shell)active=ts_ssh_shell_is_active(ctx->shell);
         xSemaphoreGive(ctx->io);
-        if(ret!=ESP_OK)ssh_request_error(req,"SSH control could not be completed for this session");
+        if(ret!=ESP_OK){
+            if(!active)ssh_close(op,"error","SSH channel failed; remote result is not confirmed");
+            else ssh_request_error(req,ret==ESP_ERR_NOT_SUPPORTED?"Unsupported SSH signal":
+                ret==ESP_ERR_INVALID_ARG?"Invalid SSH control parameters":"SSH control request failed; input was not replayed");
+        }
     }
     ts_ws_op_release(op);
 }

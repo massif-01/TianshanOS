@@ -3699,6 +3699,25 @@ if (typeof i18n !== 'undefined') i18n.registerLanguage('en-US', {
 
     // Terminal Page
     terminal: {
+        sshCapacity: "The result channel is busy. SSH was not started; try again shortly.",
+        sshCreateFailed: "The SSH session could not be created. Try again shortly.",
+        sshOpenFailed: "The remote shell could not be opened. Check whether the server permits interactive sessions.",
+        sshStartupClosed: "The SSH session ended during startup. Check the server before reconnecting.",
+        sshStatusFailed: "SSH status notification failed. The connection state is unconfirmed; reconnect to check.",
+        sshOutputIncomplete: "SSH output in this page is incomplete. The remote result is unconfirmed. Check the server before repeating commands.",
+        sshClosed: "The SSH session has ended.",
+        sshClosing: "Closing the SSH session; waiting for confirmation.",
+        sshConnecting: "Establishing the SSH connection…",
+        sshReady: "The SSH shell is ready.",
+        sshServiceStopping: "The service is stopping. This request was not accepted.",
+        sshControlUnsupported: "Unsupported SSH signal; the session is still active.",
+        sshControlInvalid: "Invalid SSH control parameters; the session is still active.",
+        sshControlFailed: "This SSH request failed. Input was not replayed.",
+        sshChannelUnknown: "The SSH channel ended unexpectedly. The remote result is unconfirmed.",
+        sshWrongOwner: "This connection does not own an active SSH session.",
+        sshBusy: "Another SSH session is active. This connection attempt was rejected.",
+        sshRequestRejected: "This SSH request was rejected.",
+
         connecting: 'Connecting to device...',
         connected: 'Connected to device',
         helpHint: 'Enter {help} to view available commands',
