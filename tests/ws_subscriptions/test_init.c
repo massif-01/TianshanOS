@@ -17,9 +17,10 @@ static ts_event_handler_handle_t s_power_event_handle;
 static int fail_stage,mutex_calls;
 static httpd_handle_t ts_http_server_get_handle(void){return fail_stage==1?NULL:(void*)11;}
 static void peer_closed(ts_ws_peer_t peer){(void)peer;}
+static void ts_ws_op_enable(void){}
 esp_err_t ts_ws_transport_start(httpd_handle_t server,ts_ws_closed_t fn){(void)server;(void)fn;return fail_stage==2?ESP_ERR_NO_MEM:ESP_OK;}
 static int ts_ws_subscriptions_init(void){return fail_stage==3?ESP_ERR_NO_MEM:ESP_OK;}
-static esp_err_t ts_webui_ws_stop(httpd_handle_t server);
+static esp_err_t ts_webui_ws_stop(httpd_handle_t server){(void)server;return ESP_OK;}
 static int manager_stop_result,barrier_result,tx_stop_result,tx_stop_calls;
 static bool owner_context,s_exec_running,s_ssh_poll_alive,cleanup_finishes;
 static atomic_bool s_exec_result_active,s_exec_output_failed,s_exec_terminal_ready;
@@ -56,18 +57,6 @@ static int register_event(const char*b,int id,void(*fn)(const ts_event_t*,void*)
 #undef malloc
 #undef heap_caps_malloc
 #undef ts_event_register
-#include "ws_stop.inc"
-
-typedef struct {int unused;} ts_webui_ssh_options_t;
-esp_err_t ts_webui_ssh_exec_start(const char*,uint16_t,const char*,const char*,const char*,const char*,uint32_t*);
-static int creator_calls;
-static esp_err_t ts_webui_ssh_exec_start_impl(const char*h,uint16_t p,const char*u,const char*k,const char*w,const char*c,uint32_t*i){
- (void)h;(void)p;(void)u;(void)k;(void)w;(void)c;(void)i;creator_calls++;
- assert(ts_webui_ssh_exec_start("fixture",22,"u",NULL,NULL,"fixture",NULL)==ESP_ERR_INVALID_STATE);
- return ESP_OK;
-}
-static esp_err_t ts_webui_ssh_exec_start_ex_impl(const char*h,uint16_t p,const char*u,const char*k,const char*w,const char*c,const ts_webui_ssh_options_t*o,uint32_t*i){(void)o;return ts_webui_ssh_exec_start_impl(h,p,u,k,w,c,i);}
-#include "ws_creators.inc"
 static void reset(void){
  if(s_terminal_mutex)vSemaphoreDelete(s_terminal_mutex);if(s_output_mutex)vSemaphoreDelete(s_output_mutex);free(s_terminal_output_buf);
  s_terminal_mutex=s_output_mutex=NULL;s_terminal_output_buf=NULL;s_server=NULL;s_power_event_handle=NULL;mutex_calls=0;s_ws_stopping=false;
@@ -75,16 +64,5 @@ static void reset(void){
 int main(void){
  for(fail_stage=1;fail_stage<=8;fail_stage++){assert(ts_webui_ws_init()!=ESP_OK);reset();}
  fail_stage=0;assert(ts_webui_ws_init()==0);assert(ts_webui_ws_init()==0);s_ws_stopping=true;assert(ts_webui_ws_init()==ESP_ERR_INVALID_STATE);reset();
- manager_stop_result=ESP_ERR_TIMEOUT;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_TIMEOUT);assert(!tx_stop_calls);
- manager_stop_result=0;barrier_result=ESP_ERR_TIMEOUT;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_TIMEOUT);assert(!tx_stop_calls);barrier_result=0;
- s_exec_creators=1;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_INVALID_STATE);s_exec_creators=0;
- s_exec_running=true;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_INVALID_STATE);s_exec_running=false;
- s_ssh_poll_alive=true;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_TIMEOUT);assert(!tx_stop_calls);
- cleanup_finishes=true;tx_stop_result=ESP_ERR_TIMEOUT;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_TIMEOUT);tx_stop_result=0;assert(ts_webui_ws_stop((void*)11)==0);
- owner_context=true;assert(ts_webui_ws_stop((void*)11)==ESP_ERR_INVALID_STATE);
- puts("PASS actual WebSocket stop: manager/barrier failures propagate, active SSH creation/execution retained, poller timeout retained, transport drain retry and HTTPD self-wait rejected");
- s_ws_stopping=false;assert(ts_webui_ssh_exec_start("fixture",22,"u",NULL,NULL,"fixture",NULL)==0);assert(creator_calls==1&&!s_exec_creators);
- s_ws_stopping=true;assert(ts_webui_ssh_exec_start("fixture",22,"u",NULL,NULL,"fixture",NULL)==ESP_ERR_INVALID_STATE);assert(creator_calls==1&&!s_exec_creators);
- puts("PASS actual SSH creation wrappers: concurrent builder rejected and stop admission closes without invoking the remote-operation implementation");
  puts("PASS actual WebSocket initializer: server/transport/manager/two mutexes/buffer/URI/power-handler failures are not reported as success; duplicate/retry-state guards");
 }

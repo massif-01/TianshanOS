@@ -18,6 +18,7 @@ static void test_point(const char *name);
 #undef s_server
 #undef s_sequence
 #include "ts_ws_subscriptions.c"
+#include "ts_ws_operation.c"
 #undef malloc
 #undef free
 static unsigned allocations, live_allocations;

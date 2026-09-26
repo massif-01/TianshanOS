@@ -69,3 +69,7 @@ void ts_ws_broadcast_to_topic(const char *topic, cJSON *data);
 #ifdef __cplusplus
 }
 #endif
+
+/* Stable existing worker wake; does not allocate or start a new task. */
+void ts_ws_subscriptions_wake(void);
+bool ts_ws_subscriptions_in_context(void);

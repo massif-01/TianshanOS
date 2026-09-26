@@ -12,9 +12,8 @@ for name,want in json.loads(Path('docs/repair/ws-f1-f2/baseline.json').read_text
  assert hashlib.sha256((Path(sys.argv[1])/name).read_bytes()).hexdigest()==want,name
 print('Frozen production snapshot hashes verified')
 HASH
-  # Current assertions/harness against unchanged frozen production sources.
-  cp tests/ws_subscriptions/{test_f1_f2.c,test_reviewer.c,run_f1_f2.sh} "$build/tests/ws_subscriptions/"
-  cp tests/ws_subscriptions/stubs/platform.h "$build/tests/ws_subscriptions/stubs/"
+  # Preserve the original harness that matches the historical production ABI.
+  tar -xzf docs/repair/ws-operation/baseline.tar.gz -C "$build" tests/ws_subscriptions/test_f1_f2.c tests/ws_subscriptions/test_reviewer.c tests/ws_subscriptions/run_f1_f2.sh tests/ws_subscriptions/stubs/platform.h
   if bash "$build/tests/ws_subscriptions/run_f1_f2.sh" > "$build/red.txt" 2>&1; then
     cat "$build/red.txt"; echo 'Unexpected baseline PASS'; exit 1
   fi
@@ -27,19 +26,7 @@ HASH
 fi
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 cjson="${IDF_PATH:-/Users/massif/esp/v5.5.2/esp-idf}/components/json/cJSON"
-python3 - "$build" <<'PY'
-from pathlib import Path
-import re,sys
-script=Path('tests/ws_subscriptions/run_reviewer.sh').read_text()
-code=script.split("<<'PY'\n",1)[1].split('\nPY',1)[0]
-exec(compile(code,'extract-reviewer','exec'))
-s=Path('components/ts_webui/src/ts_webui_ws.c').read_text();parts=[]
-for name in ['power_state_to_string','power_policy_event_handler','ts_webui_broadcast','simple_pattern_match','ssh_exec_output_callback']:
- m=re.search(r'^(?:static )?(?:const char \*|void |esp_err_t |bool )'+name+r'\([^;]*?\)\n\{',s,re.M);assert m,name
- parts.append(s[m.start():s.index('\n}',m.start())+2])
-Path(sys.argv[1],'power_caller.inc').write_text('\n'.join(parts))
-PY
-"${CC:-cc}" -std=gnu11 -g -Wno-deprecated-declarations -fsanitize=address,undefined -Itests/ws_subscriptions/stubs -Icomponents/ts_webui/include -Icomponents/ts_webui/src -I"$cjson" -I"$build" tests/ws_subscriptions/test_f1_f2.c "$cjson/cJSON.c" -o "$build/f1f2"
+"${CC:-cc}" -std=gnu11 -g -Wno-deprecated-declarations -fsanitize=address,undefined -Itests/ws_subscriptions/stubs -Icomponents/ts_webui/include -Icomponents/ts_webui/src -Icomponents/ts_security/include -Icomponents/ts_automation/include -Icomponents/ts_drivers/include -Icomponents/ts_console/include -Icomponents/ts_net/include -Wno-macro-redefined -I"$cjson" -I"$build" tests/ws_subscriptions/test_f1_f2.c "$cjson/cJSON.c" -o "$build/f1f2"
 failed=0
 scenarios="f1 f2"
 if grep -q TS_WS_POWER_SLOTS components/ts_webui/include/ts_ws_transport.h; then scenarios="$scenarios late early identity exec continuous power_retry capacity retry_limit stop timeout class power_order fair"; fi

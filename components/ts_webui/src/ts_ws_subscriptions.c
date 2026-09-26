@@ -1,6 +1,7 @@
 /** Demand-driven display telemetry. Hardware sampling/control is not scheduled here. */
 #include "ts_ws_subscriptions.h"
 #include "ts_ws_transport.h"
+#include "ts_ws_operation.h"
 #include "ts_api.h"
 #include "ts_log.h"
 #include "esp_timer.h"
@@ -196,6 +197,7 @@ static void collect_batch(target_t *targets, unsigned n, ts_ws_reservation_t *re
 /* Called by the single worker; one bounded pass, no network wait under lock. */
 static void run_batch(void)
 {
+    ts_ws_op_poll();
     ts_ws_transport_flush();
     target_t targets[MAX_SUBSCRIPTIONS];
     ts_ws_reservation_t reserved[8]={0};
@@ -279,7 +281,7 @@ static TickType_t wait_ticks(int64_t delta)
 static TickType_t next_wait(void)
 {
     if(ts_ws_transport_needs_flush()) return wait_ticks((int64_t)ts_ws_transport_retry_ms()*1000);
-    int64_t now=esp_timer_get_time(), nearest=INT64_MAX;
+    int64_t now=esp_timer_get_time(), nearest=ts_ws_op_needs_tick()?esp_timer_get_time()+100000:INT64_MAX;
     unsigned capacity=ts_ws_message_capacity() ? ts_ws_transport_capacity() : 0;
     portENTER_CRITICAL(&s_lock);
     for(unsigned i=0;i<MAX_SUBSCRIPTIONS;i++) {
@@ -488,4 +490,11 @@ void ts_ws_broadcast_to_topic(const char *topic,cJSON *data)
         if(!m) TS_LOGW(TAG,"Topic event rejected: frame budget or allocation exhausted");
     }
     leave();
+}
+
+bool ts_ws_subscriptions_in_context(void)
+{
+    TaskHandle_t current=xTaskGetCurrentTaskHandle();
+    portENTER_CRITICAL(&s_lock);bool owner=s_worker && s_worker==current;portEXIT_CRITICAL(&s_lock);
+    return owner;
 }

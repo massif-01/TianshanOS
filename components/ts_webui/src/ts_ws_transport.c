@@ -364,6 +364,7 @@ esp_err_t ts_ws_transport_submit(ts_ws_peer_t peer, ts_ws_message_t *message,
     /* Accepted into the local FIFO. Queue/send failures are settled through done,
      * exactly once. The producer reference prevents early completion reuse. */
     ts_ws_transport_flush();
+    TS_WS_TEST_POINT("B05"); /* done may have returned; producer ref still held */
     delivery_release(d);
     ts_ws_subscriptions_wake();
     return ESP_OK;
@@ -646,4 +647,12 @@ esp_err_t ts_ws_power_publish(ts_ws_reservation_t *r,const char *text)
         if(result!=ESP_OK){ret=result;portENTER_CRITICAL(&s_lock);s_tx_stats.power_failed++;portEXIT_CRITICAL(&s_lock);}
     }
     return ret;
+}
+
+esp_err_t ts_ws_reserved_target(ts_ws_reservation_t *r,unsigned index,ts_ws_peer_t peer,
+    uint64_t revision,uint64_t delivery,ts_ws_delivery_done_t done)
+{
+    if(!r || index>=r->count || r->slots[index]<0)return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_lock);s_deliveries[r->slots[index]].peer=peer;portEXIT_CRITICAL(&s_lock);
+    return ts_ws_reserved_submit(r,index,revision,delivery,NULL,done);
 }

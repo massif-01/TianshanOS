@@ -125,3 +125,7 @@ esp_err_t ts_ws_power_reserve(bool tick, ts_ws_reservation_t *r);
 esp_err_t ts_ws_power_publish(ts_ws_reservation_t *r, const char *text);
 
 esp_err_t ts_ws_result_publish(ts_ws_reservation_t *r,const ts_ws_peer_t *peers,unsigned count);
+
+/* Bind an original terminal recipient before transferring its reserved target. */
+esp_err_t ts_ws_reserved_target(ts_ws_reservation_t *r, unsigned index, ts_ws_peer_t peer,
+    uint64_t revision, uint64_t delivery, ts_ws_delivery_done_t done);
